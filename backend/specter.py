@@ -54,136 +54,184 @@ class PaperMetadata:
     journal_ref: Optional[str] = None
 
 class ArXivMetadataFetcher:
-    """Handles fetching metadata from ArXiv API with caching and rate limiting"""
+    """Enhanced ArXiv metadata fetcher with better ID cleaning"""
     
     def __init__(self):
         self.last_request_time = 0
         self.cache = {}
         self.lock = threading.Lock()
     
+    def _clean_arxiv_id(self, arxiv_id: str) -> str:
+        """Enhanced ArXiv ID cleaning with better validation"""
+        if not arxiv_id:
+            return arxiv_id
+            
+        # Remove arxiv: prefix
+        arxiv_id = re.sub(r'^(arxiv:|arXiv:)', '', arxiv_id, flags=re.IGNORECASE)
+        
+        # Remove version numbers
+        arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
+        
+        # Clean whitespace
+        arxiv_id = arxiv_id.strip()
+        
+        # FIX 1: Handle malformed IDs
+        if re.match(r'^\d{4}\.\d{4}$', arxiv_id):
+            # Already in correct new format (YYMM.NNNN)
+            return arxiv_id
+        elif re.match(r'^\d{4}\.\d{1,3}$', arxiv_id):
+            # New format but missing trailing zeros (e.g., 1609.786 -> 1609.0786)
+            parts = arxiv_id.split('.')
+            if len(parts[1]) < 4:
+                # Pad with trailing zeros
+                arxiv_id = f"{parts[0]}.{parts[1].zfill(4)}"
+                logger.info(f"🔧 Fixed ArXiv ID: {arxiv_id}")
+        elif re.match(r'^\d{3}\.\d{4}$', arxiv_id):
+            # Old format missing leading zero (e.g., 904.3356 -> 0904.3356)
+            arxiv_id = f"0{arxiv_id}"
+            logger.info(f"🔧 Fixed ArXiv ID: {arxiv_id}")
+        elif re.match(r'^[a-z-]+/\d{7}$', arxiv_id):
+            # Subject class format (e.g., math/9502222, cs/9301114)
+            # These are valid old format IDs
+            pass
+        else:
+            logger.warning(f"⚠️ Potentially invalid ArXiv ID format: {arxiv_id}")
+        
+        return arxiv_id
+    
+    def _validate_arxiv_ids(self, arxiv_ids: List[str]) -> List[str]:
+        """Validate and filter out invalid ArXiv IDs"""
+        valid_ids = []
+        
+        for arxiv_id in arxiv_ids:
+            cleaned = self._clean_arxiv_id(arxiv_id)
+            
+            # Check if ID looks valid
+            if (re.match(r'^\d{4}\.\d{4}$', cleaned) or  # New format
+                re.match(r'^[a-z-]+/\d{7}$', cleaned) or  # Old format with subject
+                re.match(r'^\d{7}$', cleaned)):  # Old format numeric only
+                valid_ids.append(cleaned)
+            else:
+                logger.warning(f"⚠️ Skipping invalid ArXiv ID: {arxiv_id} -> {cleaned}")
+        
+        return valid_ids
     def _rate_limit(self):
-        """Implement rate limiting for ArXiv API"""
+        """Ensure we don't exceed ArXiv API rate limits"""
         with self.lock:
-            current_time = time.time()
-            time_since_last = current_time - self.last_request_time
-            
-            if time_since_last < REQUEST_DELAY:
-                sleep_time = REQUEST_DELAY - time_since_last
-                logger.info(f"⏳ Rate limiting: waiting {sleep_time:.1f}s...")
+            elapsed = time.time() - self.last_request_time
+            if elapsed < REQUEST_DELAY:
+                sleep_time = REQUEST_DELAY - elapsed
+                logger.info(f"⏳ Rate limiting: sleeping {sleep_time:.1f}s")
                 time.sleep(sleep_time)
-            
             self.last_request_time = time.time()
     
-    def _clean_arxiv_id(self, arxiv_id: str) -> str:
-        """Clean and normalize ArXiv ID"""
-        arxiv_id = re.sub(r'^(arxiv:|arXiv:)', '', arxiv_id, flags=re.IGNORECASE)
-        arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
-        return arxiv_id.strip()
-    
-    def fetch_paper_metadata(self, arxiv_id: str) -> Optional[PaperMetadata]:
-        """Fetch metadata for a single paper from ArXiv API"""
-        cleaned_id = self._clean_arxiv_id(arxiv_id)
-        
-        if cleaned_id in self.cache:
-            return self.cache[cleaned_id]
-        
-        try:
-            self._rate_limit()
-            url = f"{ARXIV_API_BASE}?id_list={cleaned_id}"
-            logger.info(f"📡 Fetching metadata for {cleaned_id}...")
-            
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            
-            root = ET.fromstring(response.content)
-            entry = root.find('{http://www.w3.org/2005/Atom}entry')
-            if entry is None:
-                logger.warning(f"⚠️  No metadata found for {cleaned_id}")
-                return None
-            
-            metadata = self._parse_entry(entry, cleaned_id)
-            self.cache[cleaned_id] = metadata
-            return metadata
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Network error fetching {cleaned_id}: {e}")
-            return None
-        except ET.ParseError as e:
-            logger.error(f"❌ XML parsing error for {cleaned_id}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Unexpected error fetching {cleaned_id}: {e}")
-            return None
     
     def _parse_entry(self, entry, arxiv_id: str) -> PaperMetadata:
-        """Parse XML entry into PaperMetadata"""
-        ns = {'atom': 'http://www.w3.org/2005/Atom', 'arxiv': 'http://arxiv.org/schemas/atom'}
-        
-        title_elem = entry.find('atom:title', ns)
-        title = title_elem.text.strip() if title_elem is not None else "Unknown Title"
-        
-        authors = []
-        for author in entry.findall('atom:author', ns):
-            name_elem = author.find('atom:name', ns)
-            if name_elem is not None:
-                authors.append(name_elem.text.strip())
-        
-        summary_elem = entry.find('atom:summary', ns)
-        abstract = summary_elem.text.strip() if summary_elem is not None else ""
-        
-        published_elem = entry.find('atom:published', ns)
-        published = published_elem.text.strip() if published_elem is not None else ""
-        
-        categories = []
-        for category in entry.findall('atom:category', ns):
-            term = category.get('term')
-            if term:
-                categories.append(term)
-        
-        doi = None
-        doi_elem = entry.find('arxiv:doi', ns)
-        if doi_elem is not None:
-            doi = doi_elem.text.strip()
-        
-        journal_ref = None
-        journal_elem = entry.find('arxiv:journal_ref', ns)
-        if journal_elem is not None:
-            journal_ref = journal_elem.text.strip()
-        
-        return PaperMetadata(
-            arxiv_id=arxiv_id,
-            title=title,
-            authors=authors,
-            abstract=abstract,
-            published=published,
-            categories=categories,
-            doi=doi,
-            journal_ref=journal_ref
-        )
-    
+        """Parse ArXiv API XML entry into PaperMetadata object"""
+        try:
+            # Extract title
+            title_elem = entry.find('{http://www.w3.org/2005/Atom}title')
+            title = title_elem.text.strip() if title_elem is not None else "Unknown Title"
+            
+            # Extract authors
+            authors = []
+            for author in entry.findall('{http://www.w3.org/2005/Atom}author'):
+                name_elem = author.find('{http://www.w3.org/2005/Atom}name')
+                if name_elem is not None:
+                    authors.append(name_elem.text.strip())
+            
+            # Extract abstract
+            summary_elem = entry.find('{http://www.w3.org/2005/Atom}summary')
+            abstract = summary_elem.text.strip() if summary_elem is not None else ""
+            
+            # Extract published date
+            published_elem = entry.find('{http://www.w3.org/2005/Atom}published')
+            published = published_elem.text.strip() if published_elem is not None else ""
+            
+            # Extract categories
+            categories = []
+            for category in entry.findall('{http://www.w3.org/2005/Atom}category'):
+                term = category.get('term')
+                if term:
+                    categories.append(term)
+            
+            # Extract DOI (optional)
+            doi = None
+            for link in entry.findall('{http://www.w3.org/2005/Atom}link'):
+                if link.get('title') == 'doi':
+                    doi = link.get('href')
+                    break
+            
+            # Extract journal reference (optional)
+            journal_ref = None
+            journal_elem = entry.find('{http://arxiv.org/schemas/atom}journal_ref')
+            if journal_elem is not None:
+                journal_ref = journal_elem.text.strip()
+            
+            return PaperMetadata(
+                arxiv_id=arxiv_id,
+                title=title,
+                authors=authors,
+                abstract=abstract,
+                published=published,
+                categories=categories,
+                doi=doi,
+                journal_ref=journal_ref
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error parsing entry for {arxiv_id}: {e}")
+            # Return minimal metadata on error
+            return PaperMetadata(
+                arxiv_id=arxiv_id,
+                title="Parse Error",
+                authors=[],
+                abstract="",
+                published="",
+                categories=[]
+            )
     def fetch_batch_metadata(self, arxiv_ids: List[str]) -> Dict[str, PaperMetadata]:
-        """Fetch metadata for multiple papers efficiently"""
+        """Enhanced batch metadata fetching with better error handling"""
         results = {}
-        uncached_ids = [aid for aid in arxiv_ids if self._clean_arxiv_id(aid) not in self.cache]
         
-        logger.info(f"📚 Fetching metadata for {len(uncached_ids)} papers (cached: {len(arxiv_ids) - len(uncached_ids)})...")
+        # FIX 2: Validate IDs before making requests
+        valid_ids = self._validate_arxiv_ids(arxiv_ids)
+        uncached_ids = [aid for aid in valid_ids if aid not in self.cache]
         
-        batch_size = 10
+        logger.info(f"📚 Fetching metadata for {len(uncached_ids)} papers (cached: {len(valid_ids) - len(uncached_ids)}, invalid: {len(arxiv_ids) - len(valid_ids)})...")
+        
+        if not uncached_ids:
+            # Return cached results
+            for arxiv_id in valid_ids:
+                if arxiv_id in self.cache:
+                    results[arxiv_id] = self.cache[arxiv_id]
+            return results
+        
+        # FIX 3: Smaller batch sizes for better reliability
+        batch_size = 5  # Reduced from 10
         
         for i in range(0, len(uncached_ids), batch_size):
             batch = uncached_ids[i:i + batch_size]
-            cleaned_batch = [self._clean_arxiv_id(aid) for aid in batch]
             
             try:
                 self._rate_limit()
-                id_list = ','.join(cleaned_batch)
+                id_list = ','.join(batch)
                 url = f"{ARXIV_API_BASE}?id_list={id_list}"
+                
+                logger.info(f"🔍 Fetching batch {i//batch_size + 1}: {id_list}")
                 
                 response = requests.get(url, timeout=15)
                 response.raise_for_status()
                 
                 root = ET.fromstring(response.content)
                 
+                # Check for errors in response
+                error_elem = root.find('.//{http://www.w3.org/2005/Atom}error')
+                if error_elem is not None:
+                    logger.error(f"❌ ArXiv API error: {error_elem.text}")
+                    continue
+                
+                found_ids = set()
                 for entry in root.findall('{http://www.w3.org/2005/Atom}entry'):
                     id_elem = entry.find('{http://www.w3.org/2005/Atom}id')
                     if id_elem is not None:
@@ -194,20 +242,31 @@ class ArXivMetadataFetcher:
                         metadata = self._parse_entry(entry, arxiv_id)
                         self.cache[arxiv_id] = metadata
                         results[arxiv_id] = metadata
+                        found_ids.add(arxiv_id)
                 
-                logger.info(f"✅ Batch {i//batch_size + 1}: {len(batch)} papers processed")
+                # Log missing IDs
+                missing_ids = set(batch) - found_ids
+                if missing_ids:
+                    logger.warning(f"⚠️ Missing IDs in batch: {missing_ids}")
                 
+                logger.info(f"✅ Batch {i//batch_size + 1}: {len(found_ids)}/{len(batch)} papers found")
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ Network error in batch {i//batch_size + 1}: {e}")
+                continue
+            except ET.ParseError as e:
+                logger.error(f"❌ XML parsing error in batch {i//batch_size + 1}: {e}")
+                continue
             except Exception as e:
-                logger.error(f"❌ Error processing batch {i//batch_size + 1}: {e}")
+                logger.error(f"❌ Unexpected error in batch {i//batch_size + 1}: {e}")
                 continue
         
-        for arxiv_id in arxiv_ids:
-            cleaned_id = self._clean_arxiv_id(arxiv_id)
-            if cleaned_id in self.cache:
-                results[cleaned_id] = self.cache[cleaned_id]
+        # Add cached results
+        for arxiv_id in valid_ids:
+            if arxiv_id in self.cache:
+                results[arxiv_id] = self.cache[arxiv_id]
         
         return results
-
 class SPECTER2Search:
     def __init__(self):
         """Initialize SPECTER2 search system with metadata fetching"""
@@ -459,43 +518,45 @@ class SPECTER2Search:
     
     def auto_search(self, query_text: str, top_k: int = 10,
                    fetch_metadata: bool = True,
-                   title_score_th: float = 0.80):
-        """Automatically choose between title search and SPECTER2 search"""
+                   title_score_th: float = 0.7):  # FIX 4: Lower threshold
+        """Auto search with more reasonable threshold"""
         
         def looks_like_title(q: str) -> bool:
-            """Detect if query looks like a paper title"""
+            """Enhanced title detection"""
             tokens = q.strip().split()
             word_count = len(tokens)
             char_count = len(q)
             starts_uppercase = q[:1].isupper()
             
-            result = (word_count <= 8 or char_count <= 60) and starts_uppercase
+            # FIX 5: More flexible title detection
+            has_common_words = any(word.lower() in ['paper', 'study', 'analysis', 'review'] 
+                                 for word in tokens)
             
-            logger.info(f"🔍 TITLE DETECTION for: '{q}'")
+            # Accept as title if:
+            # - Short and starts with uppercase, OR
+            # - Contains common academic words
+            result = ((word_count <= 8 or char_count <= 60) and starts_uppercase) or has_common_words
+            
+            logger.info(f"🔍 ENHANCED TITLE DETECTION for: '{q}'")
             logger.info(f"   📊 Word count: {word_count} (≤8? {word_count <= 8})")
             logger.info(f"   📊 Character count: {char_count} (≤60? {char_count <= 60})")
             logger.info(f"   📊 Starts uppercase: {starts_uppercase}")
+            logger.info(f"   📊 Has common words: {has_common_words}")
             logger.info(f"   ✅ Result: {result}")
             
             return result
         
-        logger.info(f"🚀 AUTO_SEARCH started for: '{query_text}'")
+        logger.info(f"🚀 ENHANCED AUTO_SEARCH started for: '{query_text}'")
         logger.info(f"   📋 Parameters: top_k={top_k}, fetch_metadata={fetch_metadata}, title_score_th={title_score_th}")
-        logger.info(f"   🔧 Title model available: {self.title_model is not None}")
-        logger.info(f"   🔧 Title client available: {self.title_client is not None}")
         
         title_detected = looks_like_title(query_text)
-        logger.info(f"   🎯 Title detected: {title_detected}")
         
-        # Try title search if conditions are met
+        # Try title search with lower threshold
         if title_detected and self.title_model is not None and self.title_client is not None:
             try:
                 logger.info("🔎 AUTO: Trying title-only MiniLM search...")
                 
                 t_res, t_ms, meta = self.search_titles(query_text, top_k, fetch_metadata)
-                
-                logger.info(f"   📈 Title search completed in {t_ms:.1f}ms")
-                logger.info(f"   📊 Results returned: {len(t_res) if t_res else 0}")
                 
                 if t_res:
                     top_score = t_res[0].score
@@ -507,25 +568,15 @@ class SPECTER2Search:
                         return t_res, t_ms, "title", meta
                     else:
                         logger.info(f"↩️ Fallback to SPECTER (low score: {top_score:.3f} < {title_score_th})")
-                else:
-                    logger.info("↩️ Fallback to SPECTER (no results returned)")
-                    
+                        
             except Exception as e:
                 logger.error(f"❌ Title search failed: {e}")
-                logger.warning("⚠️ Title search failed, falling back to SPECTER2")
-        else:
-            if not title_detected:
-                logger.info("↩️ Skipping title search: Query not detected as title")
-            if self.title_model is None:
-                logger.info("↩️ Skipping title search: Title model not available")
-            if self.title_client is None:
-                logger.info("↩️ Skipping title search: Title client not available")
         
-        # Fallback to SPECTER2
+        # Fallback to SPECTER2 with faster mode
         logger.info("🔄 Using SPECTER2 search...")
-        s_res, s_ms, meta = self.search(query_text, top_k, "balanced", fetch_metadata)
+        s_res, s_ms, meta = self.search(query_text, top_k, "fast", fetch_metadata)  # FIX 6: Use fast mode
         return s_res, s_ms, "specter", meta
-    
+
     def _maybe_fetch_metadata(self, results, fetch_metadata):
         """Helper to fetch metadata if requested"""
         if not fetch_metadata or not results:

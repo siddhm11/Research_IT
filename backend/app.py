@@ -83,6 +83,13 @@ class ComparisonRequest(BaseModel):
     fetch_metadata: bool = Field(True)
     return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
 
+class SimilarityRequest(BaseModel):
+    arxiv_id: str = Field(..., description="The ArXiv ID of the paper to find similarities for.")
+    top_k: int = Field(10, ge=1, le=50)
+    fetch_metadata: bool = Field(True)
+    return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
+    
+    
 class PaperMetadata(BaseModel):
     arxiv_id: str
     title: str
@@ -284,7 +291,47 @@ async def get_stats():
     except Exception as e:
         logger.error(f"❌ Stats error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
 
+# The corrected /similar endpoint
+@app.post("/similar", response_model=SearchResponse, tags=["Similarity"])
+async def find_similar_papers(request: SimilarityRequest):
+    """
+    Finds research papers that are semantically similar to a given ArXiv ID.
+    """
+    if search_system is None:
+        raise HTTPException(status_code=503, detail="Search system not initialized")
+    
+    try:
+        logger.info(f"🔎 Similarity request for ArXiv ID: '{request.arxiv_id}'")
+        
+        results, search_time, metadata_dict = await asyncio.to_thread(
+            search_system.find_similar_by_id,
+            arxiv_id=request.arxiv_id,
+            top_k=request.top_k,
+            fetch_metadata=request.fetch_metadata,
+            return_vector=request.return_vector
+        )
+        
+        return SearchResponse(
+            query=f"Papers similar to {request.arxiv_id}",
+            results=format_results(results, metadata_dict, request.fetch_metadata),
+            search_time_ms=search_time,
+            mode_used="similarity",
+            total_results=len(results),
+            metadata_fetched=request.fetch_metadata
+        )
+
+    # This block now specifically catches the ValueError from the backend
+    except ValueError as e:
+        logger.warning(f"⚠️ Similarity search failed for ID '{request.arxiv_id}': {e}")
+        # And converts it to a 404 Not Found error for the API client
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    # This block handles all other unexpected errors
+    except Exception as e:
+        logger.error(f"❌ Unexpected similarity search error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected internal error occurred.")
 
 if __name__ == "__main__":
     uvicorn.run(

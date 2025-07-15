@@ -26,6 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Your Qdrant Configuration
+
 MINILM_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
 TITLE_EMB_DIM         = 384
 
@@ -269,6 +270,7 @@ class SPECTER2Search:
         self.metadata_fetcher = ArXivMetadataFetcher()
         self.title_model: Optional[SentenceTransformer] = None
         self.title_client: Optional[QdrantClient] = None
+        self.collection_name = COLLECTION_NAME
         
         # Initialize components
         self._setup_model()
@@ -440,7 +442,65 @@ class SPECTER2Search:
             logger.error(f"❌ Error in title search: {e}")
             raise
         
+    
+    def find_similar_by_id(self, arxiv_id: str, top_k: int = 10, fetch_metadata: bool = True, return_vector: bool = False):
+        """
+        Finds papers similar to a given paper using its arXiv ID.
         
+        1. Fetches the vector for the given arxiv_id.
+        2. Uses that vector to perform a search for similar vectors.
+        3. Filters out the original paper from the results.
+        """
+        logger.info(f"🔎 Finding papers similar to ArXiv ID: {arxiv_id}...")
+        
+        # Step 1: Retrieve the vector for the source paper
+        try:
+            # We use a filter to find the paper by its arxiv_id in the payload
+            source_papers = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=models.Filter(
+                    must=[models.FieldCondition(key="arxiv_id", match=models.MatchValue(value=arxiv_id))]
+                ),
+                limit=1,
+                with_vectors=True
+            )
+            
+            if not source_papers[0]:
+                logger.error(f"❌ Could not find source paper with ArXiv ID: {arxiv_id}")
+                return [], 0.0, {}
+
+            source_vector = source_papers[0][0].vector
+            
+        # This is the corrected version
+        except Exception as e:
+            logger.error(f"❌ Error fetching source vector for {arxiv_id}: {e}")
+            # Raise a standard Python error. The API layer (app.py) will handle it.
+            raise ValueError(f"Paper with ArXiv ID '{arxiv_id}' not found in the database.")
+        # Step 2: Use the fetched vector to find similar papers.
+        # We fetch k+1 results to have a buffer in case the source paper is returned.
+        start_time = time.time()
+        similar_results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=source_vector,
+            limit=top_k + 1,
+            with_payload=True,
+            with_vectors=return_vector
+        )
+        search_time = (time.time() - start_time) * 1000
+
+        # Step 3: Filter out the original paper from the results list
+        final_results = [
+            result for result in similar_results 
+            if result.payload.get('arxiv_id') != arxiv_id
+        ][:top_k] # Ensure we only return top_k results
+
+        logger.info(f"✅ Found {len(final_results)} similar papers in {search_time:.0f}ms.")
+
+        # Step 4: Fetch metadata for the similar papers
+        metadata_dict = self._maybe_fetch_metadata(final_results, fetch_metadata)
+
+        return final_results, search_time, metadata_dict
+    
     def _generate_query_embedding(self, query_text):
         """Generate SPECTER2 embedding for query"""
         inputs = self.tokenizer(

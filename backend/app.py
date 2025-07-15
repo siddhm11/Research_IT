@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import logging
 
 # Import your existing SPECTER2 search class
-from specter2_search_enhanced import SPECTER2Search
+from specter import SPECTER2Search
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

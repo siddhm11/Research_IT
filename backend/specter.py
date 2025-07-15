@@ -26,14 +26,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Your Qdrant Configuration
-QDRANT_URL = "hidden"
-QDRANT_API_KEY = "ok_hidden"
-COLLECTION_NAME = "arxiv_specter2_recommendations"
-
-# ───────────  MiniLM TITLE-ONLY collection  ───────────
-QDRANT_TITLE_URL      = "hidden"
-QDRANT_TITLE_API_KEY  = "ok_hidden"
-TITLE_COLLECTION_NAME = "arxiv_papers_titles"
 MINILM_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
 TITLE_EMB_DIM         = 384
 
@@ -107,7 +99,7 @@ class ArXivMetadataFetcher:
             cleaned = self._clean_arxiv_id(arxiv_id)
             
             # Check if ID looks valid
-            if (re.match(r'^\d{4}\.\d{4}$', cleaned) or  # New format
+            if (re.match(r'^\d{4}\.\d{4,5}$', cleaned) or # FIX: New format (YYMM.NNNN or YYMM.NNNNN) or  # New format
                 re.match(r'^[a-z-]+/\d{7}$', cleaned) or  # Old format with subject
                 re.match(r'^\d{7}$', cleaned)):  # Old format numeric only
                 valid_ids.append(cleaned)
@@ -408,7 +400,8 @@ class SPECTER2Search:
             logger.error(f"❌ Error generating title embedding: {e}")
             raise
     
-    def search_titles(self, query_text: str, top_k: int = 10, fetch_metadata: bool = True):
+    # Add 'return_vector=False' to the signature
+    def search_titles(self, query_text: str, top_k: int = 10, fetch_metadata: bool = True, return_vector: bool = False):
         """Search using title-only MiniLM embeddings"""
         logger.info(f"📚 TITLE SEARCH for: '{query_text}'")
         
@@ -419,12 +412,10 @@ class SPECTER2Search:
             raise RuntimeError("Title client not available")
         
         try:
-            # Generate embedding
             logger.info("🔢 Generating title embedding...")
             qvec = self._generate_title_embedding(query_text)
             logger.info(f"✅ Embedding generated, shape: {qvec.shape}")
             
-            # Search
             logger.info("🔍 Executing title search...")
             t0 = time.time()
             
@@ -433,14 +424,14 @@ class SPECTER2Search:
                 query_vector=qvec.astype(np.float32).tolist(),
                 limit=top_k,
                 search_params=models.SearchParams(hnsw_ef=64),
-                with_payload=True
+                with_payload=True,
+                with_vectors=return_vector # <-- ADD THIS LINE
             )
             
             search_time = (time.time() - t0) * 1000
             logger.info(f"✅ Title search completed in {search_time:.1f}ms")
             logger.info(f"📊 Found {len(results)} results")
             
-            # Fetch metadata
             metadata = self._maybe_fetch_metadata(results, fetch_metadata)
             
             return results, search_time, metadata
@@ -448,7 +439,8 @@ class SPECTER2Search:
         except Exception as e:
             logger.error(f"❌ Error in title search: {e}")
             raise
-    
+        
+        
     def _generate_query_embedding(self, query_text):
         """Generate SPECTER2 embedding for query"""
         inputs = self.tokenizer(
@@ -481,7 +473,8 @@ class SPECTER2Search:
         query_embedding = query_embedding / np.linalg.norm(query_embedding)
         return query_embedding
     
-    def search(self, query_text, top_k=10, search_mode="balanced", fetch_metadata=True):
+    # Add 'return_vector=False' to the signature
+    def search(self, query_text, top_k=10, search_mode="balanced", fetch_metadata=True, return_vector: bool = False):
         """Search papers using SPECTER2 embeddings"""
         ef_configs = {
             'fast': 32,
@@ -499,7 +492,8 @@ class SPECTER2Search:
                 query_vector=query_embedding.astype(np.float32).tolist(),
                 limit=top_k,
                 search_params=models.SearchParams(hnsw_ef=ef_search),
-                with_payload=True
+                with_payload=True,
+                with_vectors=return_vector # <-- ADD THIS LINE
             )
             search_time = (time.time() - start_time) * 1000
             logger.info(f"✅ SPECTER2 search completed in {search_time:.0f}ms, found {len(results)} results")
@@ -516,9 +510,11 @@ class SPECTER2Search:
         
         return results, search_time, metadata_dict
     
+    
+    
     def auto_search(self, query_text: str, top_k: int = 10,
                    fetch_metadata: bool = True,
-                   title_score_th: float = 0.7):  # FIX 4: Lower threshold
+                   title_score_th: float = 0.7 , return_vector: bool = False):  # FIX 4: Lower threshold
         """Auto search with more reasonable threshold"""
         
         def looks_like_title(q: str) -> bool:
@@ -556,7 +552,7 @@ class SPECTER2Search:
             try:
                 logger.info("🔎 AUTO: Trying title-only MiniLM search...")
                 
-                t_res, t_ms, meta = self.search_titles(query_text, top_k, fetch_metadata)
+                t_res, t_ms, meta = self.search_titles(query_text, top_k, fetch_metadata, return_vector=return_vector)
                 
                 if t_res:
                     top_score = t_res[0].score
@@ -574,7 +570,7 @@ class SPECTER2Search:
         
         # Fallback to SPECTER2 with faster mode
         logger.info("🔄 Using SPECTER2 search...")
-        s_res, s_ms, meta = self.search(query_text, top_k, "fast", fetch_metadata)  # FIX 6: Use fast mode
+        s_res, s_ms, meta = self.search(query_text, top_k, "fast", fetch_metadata, return_vector=return_vector)  # FIX 6: Use fast mode
         return s_res, s_ms, "specter", meta
 
     def _maybe_fetch_metadata(self, results, fetch_metadata):
@@ -587,11 +583,11 @@ class SPECTER2Search:
             return self.metadata_fetcher.fetch_batch_metadata(arxiv_ids)
         return {}
     
-    def smart_search(self, query_text, top_k=10, min_good_results=3, fetch_metadata=True):
+    def smart_search(self, query_text, top_k=10, min_good_results=3, fetch_metadata=True, return_vector: bool = False):
         """Intelligent search that automatically adjusts efSearch for optimal results"""
         logger.info(f"🧠 Smart search for: '{query_text}'")
         
-        results, search_time, metadata = self.search(query_text, top_k, "fast", fetch_metadata)
+        results, search_time, metadata = self.search(query_text, top_k, "fast", fetch_metadata, return_vector=return_vector)
         good_results = len([r for r in results if r.score > 0.7])
         
         if good_results >= min_good_results:
@@ -599,7 +595,7 @@ class SPECTER2Search:
             return results, search_time, "fast", metadata
         
         logger.info(f"🔄 Escalating to balanced search...")
-        results, search_time, metadata = self.search(query_text, top_k, "balanced", fetch_metadata)
+        results, search_time, metadata = self.search(query_text, top_k, "balanced", fetch_metadata, return_vector=return_vector)
         good_results = len([r for r in results if r.score > 0.7])
         
         if good_results >= min_good_results:
@@ -607,13 +603,13 @@ class SPECTER2Search:
             return results, search_time, "balanced", metadata
         
         logger.info(f"🔄 Escalating to quality search...")
-        results, search_time, metadata = self.search(query_text, top_k, "quality", fetch_metadata)
+        results, search_time, metadata = self.search(query_text, top_k, "quality", fetch_metadata, return_vector=return_vector)
         good_results = len([r for r in results if r.score > 0.7])
         logger.info(f"✅ Quality search completed: {good_results} good results in {search_time:.0f}ms")
         
         return results, search_time, "quality", metadata
     
-    def compare_search_modes(self, query_text, top_k=10, fetch_metadata=True):
+    def compare_search_modes(self, query_text, top_k=10, fetch_metadata=True, return_vector: bool = False):
         """Compare all search modes"""
         logger.info(f"🔍 COMPARING SEARCH MODES for: '{query_text}'")
         
@@ -622,7 +618,7 @@ class SPECTER2Search:
         
         for mode in ["fast", "balanced", "quality"]:
             logger.info(f"--- {mode.upper()} MODE ---")
-            results, search_time, metadata = self.search(query_text, top_k, mode, fetch_metadata)
+            results, search_time, metadata = self.search(query_text, top_k, mode, fetch_metadata, return_vector=return_vector)
             
             all_metadata.update(metadata)
             

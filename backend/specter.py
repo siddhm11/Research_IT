@@ -26,13 +26,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Your Qdrant Configuration
-QDRANT_URL = "https://6b25695f-de3c-4dbd-bb36-6de748ff47f2.us-east-1-0.aws.cloud.qdrant.io"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ug0KQAaAKM7Hv-L3NprJnvuLgNcNL9D9847dfWRL_Fk"
+QDRANT_URL = "hidden"
+QDRANT_API_KEY = "ok_hidden"
 COLLECTION_NAME = "arxiv_specter2_recommendations"
 
 # ───────────  MiniLM TITLE-ONLY collection  ───────────
-QDRANT_TITLE_URL      = "https://ba0f9774-1b9e-4b0b-bb05-db8fadfe122c.eu-west-2-0.aws.cloud.qdrant.io"
-QDRANT_TITLE_API_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.sMVFQwd_dg3z89uIih5r5olFlbXLAjl_Gcx0V5IJG-U"
+QDRANT_TITLE_URL      = "hidden"
+QDRANT_TITLE_API_KEY  = "ok_hidden"
 TITLE_COLLECTION_NAME = "arxiv_papers_titles"
 MINILM_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
 TITLE_EMB_DIM         = 384

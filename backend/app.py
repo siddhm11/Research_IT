@@ -53,7 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Pydantic Models ---
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -61,6 +60,7 @@ class SearchRequest(BaseModel):
     search_mode: str = Field("balanced", pattern="^(fast|balanced|quality)$")
     fetch_metadata: bool = Field(True)
     return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
+    save_embeddings_only: bool = Field(False, description="Set to true to save only ArXiv IDs and vectors to a CSV.")
 
 class AutoSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -68,6 +68,7 @@ class AutoSearchRequest(BaseModel):
     fetch_metadata: bool = Field(True)
     title_score_th: float = Field(0.7, ge=0.5, le=1.0)
     return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
+    save_embeddings_only: bool = Field(False, description="Set to true to save only ArXiv IDs and vectors to a CSV.")
 
 class SmartSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -75,20 +76,20 @@ class SmartSearchRequest(BaseModel):
     min_good_results: int = Field(3, ge=1, le=10)
     fetch_metadata: bool = Field(True)
     return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
-    
-
-class ComparisonRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500)
-    top_k: int = Field(10, ge=1, le=50)
-    fetch_metadata: bool = Field(True)
-    return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
+    save_embeddings_only: bool = Field(False, description="Set to true to save only ArXiv IDs and vectors to a CSV.")
 
 class SimilarityRequest(BaseModel):
     arxiv_id: str = Field(..., description="The ArXiv ID of the paper to find similarities for.")
     top_k: int = Field(10, ge=1, le=50)
     fetch_metadata: bool = Field(True)
     return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
-    
+    save_embeddings_only: bool = Field(False, description="Set to true to save only ArXiv IDs and vectors to a CSV.")
+
+class ComparisonRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    top_k: int = Field(10, ge=1, le=50)
+    fetch_metadata: bool = Field(True)
+    return_vector: bool = Field(False, description="Set to true to return the embedding vector for each result.")
     
 class PaperMetadata(BaseModel):
     arxiv_id: str
@@ -152,7 +153,7 @@ def format_results(results_raw: list, metadata_dict: dict, fetch_metadata: bool)
             score=result.score,
             arxiv_id=arxiv_id,
             metadata=paper_metadata,
-            vector=result.vector # <-- ADD THIS aSSIGNMENT
+            vector=getattr(result, 'vector', None) 
         ))
     return formatted
 
@@ -182,44 +183,78 @@ async def auto_search_papers(request: AutoSearchRequest):
     """Automatically selects the best search strategy (title or semantic)."""
     if search_system is None:
         raise HTTPException(status_code=503, detail="Search system not initialized")
+    
+    # If we need to save embeddings, we MUST fetch them from the database.
+    should_return_vector = request.return_vector or request.save_embeddings_only
+    
     try:
         logger.info(f"🚀 Auto-search request: '{request.query}'")
         results, search_time, mode_used, metadata_dict = await asyncio.to_thread(
             search_system.auto_search,
             query_text=request.query, top_k=request.top_k,
             fetch_metadata=request.fetch_metadata, title_score_th=request.title_score_th,
-            return_vector=request.return_vector # <-- ADD THIS PARAMETER
+            return_vector=should_return_vector
         )
+        
+        # This block for saving full results is now removed.
+
+        # Check if the user requested to save only the embeddings.
+        if request.save_embeddings_only and results:
+            await asyncio.to_thread(
+                # CRITICAL BUG FIX: This now correctly calls 'save_embeddings_to_csv'
+                search_system.save_embeddings_to_csv,
+                results, request.query
+            )
+            
         return SearchResponse(
             query=request.query, results=format_results(results, metadata_dict, request.fetch_metadata),
-            search_time_ms=search_time, mode_used=mode_used,
-            total_results=len(results), metadata_fetched=request.fetch_metadata
+            search_time_ms=search_time, 
+            mode_used=mode_used,
+            total_results=len(results), 
+            metadata_fetched=request.fetch_metadata
         )
     except Exception as e:
         logger.error(f"❌ Auto-search error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+    
 @app.post("/search", response_model=SearchResponse, tags=["Search"])
 async def search_papers(request: SearchRequest):
     """Performs a search using a specific mode: fast, balanced, or quality."""
     if search_system is None:
         raise HTTPException(status_code=503, detail="Search system not initialized")
+    
+    # Add this logic to the top of the function
+    should_return_vector = request.return_vector or request.save_embeddings_only
+    
     try:
         logger.info(f"🔍 Search request: '{request.query}' (mode: {request.search_mode})")
         results, search_time, metadata_dict = await asyncio.to_thread(
             search_system.search,
             query_text=request.query, top_k=request.top_k,
-            search_mode=request.search_mode, fetch_metadata=request.fetch_metadata
+            search_mode=request.search_mode, 
+            fetch_metadata=request.fetch_metadata,
+            return_vector=should_return_vector # Use the new variable here
         )
+
+        # Add this logic block to handle saving embeddings
+        if request.save_embeddings_only and results:
+            await asyncio.to_thread(
+                search_system.save_embeddings_to_csv,
+                results, request.query
+            )
+
         return SearchResponse(
             query=request.query, results=format_results(results, metadata_dict, request.fetch_metadata),
             search_time_ms=search_time, mode_used=request.search_mode,
-            total_results=len(results), metadata_fetched=request.fetch_metadata
+            total_results=len(results), 
+            metadata_fetched=request.fetch_metadata
         )
     except Exception as e:
         logger.error(f"❌ Search error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+    
 @app.post("/smart-search", response_model=SearchResponse, tags=["Search"])
 async def smart_search_papers(request: SmartSearchRequest):
     """Automatically escalates search mode to ensure a minimum number of good results."""
@@ -230,12 +265,16 @@ async def smart_search_papers(request: SmartSearchRequest):
         results, search_time, mode_used, metadata_dict = await asyncio.to_thread(
             search_system.smart_search,
             query_text=request.query, top_k=request.top_k,
-            min_good_results=request.min_good_results, fetch_metadata=request.fetch_metadata
+            min_good_results=request.min_good_results, 
+            fetch_metadata=request.fetch_metadata,
+            return_vector=request.return_vector
         )
         return SearchResponse(
             query=request.query, results=format_results(results, metadata_dict, request.fetch_metadata),
-            search_time_ms=search_time, mode_used=mode_used,
-            total_results=len(results), metadata_fetched=request.fetch_metadata
+            search_time_ms=search_time, 
+            mode_used=mode_used,
+            total_results=len(results), 
+            metadata_fetched=request.fetch_metadata
         )
     except Exception as e:
         logger.error(f"❌ Smart search error: {e}", exc_info=True)
@@ -251,7 +290,8 @@ async def compare_search_modes(request: ComparisonRequest):
         mode_results, best_mode, all_metadata = await asyncio.to_thread(
             search_system.compare_search_modes,
             query_text=request.query, top_k=request.top_k,
-            fetch_metadata=request.fetch_metadata
+            fetch_metadata=request.fetch_metadata,
+            return_vector=request.return_vector
         )
         comparisons = []
         for mode, data in mode_results.items():

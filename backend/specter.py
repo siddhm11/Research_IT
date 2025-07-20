@@ -17,6 +17,9 @@ from functools import lru_cache
 import re
 import logging
 from sentence_transformers import SentenceTransformer
+import csv 
+import os
+
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(
@@ -553,7 +556,7 @@ class SPECTER2Search:
                 limit=top_k,
                 search_params=models.SearchParams(hnsw_ef=ef_search),
                 with_payload=True,
-                with_vectors=return_vector # <-- ADD THIS LINE
+                with_vectors=return_vector 
             )
             search_time = (time.time() - start_time) * 1000
             logger.info(f"✅ SPECTER2 search completed in {search_time:.0f}ms, found {len(results)} results")
@@ -574,7 +577,9 @@ class SPECTER2Search:
     
     def auto_search(self, query_text: str, top_k: int = 10,
                    fetch_metadata: bool = True,
-                   title_score_th: float = 0.7 , return_vector: bool = False):  # FIX 4: Lower threshold
+                   title_score_th: float = 0.7 , 
+                   return_vector: bool = False,
+                   show_vectors: bool = False):  # FIX 4: Lower threshold
         """Auto search with more reasonable threshold"""
         
         def looks_like_title(q: str) -> bool:
@@ -715,8 +720,8 @@ class SPECTER2Search:
         
         return 'quality'
     
-    def print_results(self, results, search_time, query_text, metadata_dict=None, mode=""):
-        """Pretty print search results with metadata"""
+    def print_results(self, results, search_time, query_text, metadata_dict=None, mode="", show_vectors=False):
+        """Pretty print search results with metadata and optionally vectors"""
         logger.info(f"🔍 SPECTER2 Results for: '{query_text}'")
         logger.info(f"⚡ Search completed in {search_time:.0f}ms {mode}")
         logger.info(f"🚀 Using GPU*{self.gpu_count} optimization")
@@ -734,6 +739,14 @@ class SPECTER2Search:
             
             logger.info(f"{i:2d}. {confidence} Score: {result.score:.4f}")
             logger.info(f"    📄 ArXiv ID: {arxiv_id}")
+            
+            # Show vector if requested and available
+            if show_vectors and hasattr(result, 'vector') and result.vector is not None:
+                vector_preview = result.vector[:10] if len(result.vector) > 10 else result.vector
+                logger.info(f"    🔢 Vector (dim={len(result.vector)}): {vector_preview}...")
+                # Optionally show vector stats
+                vector_array = np.array(result.vector)
+                logger.info(f"    📊 Vector stats: mean={vector_array.mean():.6f}, std={vector_array.std():.6f}, norm={np.linalg.norm(vector_array):.6f}")
             
             if paper_metadata:
                 logger.info(f"    📚 Title: {paper_metadata.title}")
@@ -773,3 +786,164 @@ class SPECTER2Search:
                 logger.info(f"    ⚠️  Metadata not available")
             
             logger.info("")  # Empty line for readability
+    def analyze_vectors(self, results, query_vector=None):
+        """Analyze and compare vectors from search results"""
+        if not results or not hasattr(results[0], 'vector') or results[0].vector is None:
+            logger.warning("⚠️ No vectors available in results")
+            return
+        
+        logger.info("📊 VECTOR ANALYSIS")
+        logger.info("=" * 50)
+        
+        # Extract vectors
+        vectors = [np.array(r.vector) for r in results if hasattr(r, 'vector') and r.vector is not None]
+        
+        if not vectors:
+            logger.warning("⚠️ No valid vectors found")
+            return
+        
+        # Basic stats
+        vector_dim = len(vectors[0])
+        logger.info(f"🔢 Vector dimension: {vector_dim}")
+        logger.info(f"📊 Number of vectors: {len(vectors)}")
+        
+        # Vector norms
+        norms = [np.linalg.norm(v) for v in vectors]
+        logger.info(f"📏 Vector norms - Mean: {np.mean(norms):.6f}, Std: {np.std(norms):.6f}")
+        
+        # If query vector provided, compute similarities
+        if query_vector is not None:
+            query_vec = np.array(query_vector)
+            similarities = [np.dot(query_vec, v) / (np.linalg.norm(query_vec) * np.linalg.norm(v)) 
+                        for v in vectors]
+            logger.info(f"🎯 Cosine similarities with query:")
+            for i, sim in enumerate(similarities[:5]):  # Show top 5
+                arxiv_id = results[i].payload.get('arxiv_id', 'Unknown')
+                logger.info(f"    {i+1}. {arxiv_id}: {sim:.6f}")
+        
+        # Compute pairwise similarities between top results
+        if len(vectors) >= 2:
+            logger.info(f"🔗 Pairwise similarities (top 3 results):")
+            for i in range(min(3, len(vectors))):
+                for j in range(i+1, min(3, len(vectors))):
+                    sim = np.dot(vectors[i], vectors[j]) / (np.linalg.norm(vectors[i]) * np.linalg.norm(vectors[j]))
+                    id_i = results[i].payload.get('arxiv_id', f'Result_{i+1}')
+                    id_j = results[j].payload.get('arxiv_id', f'Result_{j+1}')
+                    logger.info(f"    {id_i} ↔ {id_j}: {sim:.6f}")
+
+    def save_vectors_to_file(self, results, filename="search_vectors.npz", include_metadata=True):
+        """Save vectors and metadata to file for analysis"""
+        if not results or not hasattr(results[0], 'vector') or results[0].vector is None:
+            logger.warning("⚠️ No vectors to save")
+            return
+        
+        # Extract vectors and metadata
+        vectors = []
+        metadata = []
+        
+        for result in results:
+            if hasattr(result, 'vector') and result.vector is not None:
+                vectors.append(result.vector)
+                if include_metadata:
+                    meta = {
+                        'arxiv_id': result.payload.get('arxiv_id', ''),
+                        'score': result.score,
+                        'payload': dict(result.payload)
+                    }
+                    metadata.append(meta)
+        
+        # Save to file
+        vectors_array = np.array(vectors)
+        save_dict = {'vectors': vectors_array}
+        
+        if include_metadata:
+            save_dict['metadata'] = metadata
+        
+        np.savez_compressed(filename, **save_dict)
+        logger.info(f"💾 Saved {len(vectors)} vectors to {filename}")
+        logger.info(f"📊 Vector shape: {vectors_array.shape}")
+
+    def compare_vector_distributions(self, results1, results2, label1="Search 1", label2="Search 2"):
+        """Compare vector distributions between two search results"""
+        def get_vector_stats(results, label):
+            vectors = [np.array(r.vector) for r in results 
+                    if hasattr(r, 'vector') and r.vector is not None]
+            if not vectors:
+                return None
+            
+            vectors_array = np.array(vectors)
+            stats = {
+                'mean_norm': np.mean([np.linalg.norm(v) for v in vectors]),
+                'std_norm': np.std([np.linalg.norm(v) for v in vectors]),
+                'mean_values': np.mean(vectors_array, axis=0),
+                'std_values': np.std(vectors_array, axis=0),
+                'count': len(vectors)
+            }
+            
+            logger.info(f"📊 {label} Vector Statistics:")
+            logger.info(f"    Count: {stats['count']}")
+            logger.info(f"    Mean norm: {stats['mean_norm']:.6f}")
+            logger.info(f"    Std norm: {stats['std_norm']:.6f}")
+            logger.info(f"    Mean value: {np.mean(stats['mean_values']):.6f}")
+            logger.info(f"    Std value: {np.mean(stats['std_values']):.6f}")
+            
+            return stats
+        
+        logger.info("🔍 COMPARING VECTOR DISTRIBUTIONS")
+        logger.info("=" * 50)
+        
+        stats1 = get_vector_stats(results1, label1)
+        stats2 = get_vector_stats(results2, label2)
+        
+        if stats1 and stats2:
+            # Compare distributions
+            norm_diff = abs(stats1['mean_norm'] - stats2['mean_norm'])
+            logger.info(f"📈 Norm difference: {norm_diff:.6f}")
+            
+            # Compare mean vectors
+            mean_similarity = np.dot(stats1['mean_values'], stats2['mean_values']) / \
+                            (np.linalg.norm(stats1['mean_values']) * np.linalg.norm(stats2['mean_values']))
+            logger.info(f"🎯 Mean vector similarity: {mean_similarity:.6f}")
+
+    
+    def save_embeddings_to_csv(self, results, query_text, directory="search_embeddings"):
+        """Saves the ArXiv ID and embedding vector for each result to a CSV file."""
+        if not results or not hasattr(results[0], 'vector') or not results[0].vector:
+            logger.warning("No results with vectors to save to CSV.")
+            return None
+
+        # --- Create a safe filename ---
+        safe_query = "".join(c for c in query_text if c.isalnum() or c in (' ', '_')).rstrip()
+        safe_query = safe_query.replace(' ', '_')
+        filename = f"embeddings_{safe_query[:50]}.csv"
+
+        # --- Ensure the directory exists ---
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            logger.info(f"📁 Created directory: {directory}")
+        
+        filepath = os.path.join(directory, filename)
+
+        # --- Define CSV headers ---
+        # The first header is 'arxiv_id', the rest are for the vector dimensions
+        vector_dim = len(results[0].vector)
+        headers = ['arxiv_id'] + [f'dim_{i}' for i in range(vector_dim)]
+
+        try:
+            with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers) # Write the header row
+
+                for result in results:
+                    # Ensure the result has a vector before trying to save
+                    if hasattr(result, 'vector') and result.vector:
+                        arxiv_id = result.payload.get('arxiv_id', 'N/A')
+                        # Create a row with the ID followed by all vector elements
+                        row = [arxiv_id] + result.vector
+                        writer.writerow(row)
+            
+            logger.info(f"💾 Successfully saved embeddings for {len(results)} results to {filepath}")
+            return filepath
+        except IOError as e:
+            logger.error(f"❌ Failed to write CSV file at {filepath}: {e}")
+            return None

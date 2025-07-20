@@ -3,9 +3,7 @@ import logging
 
 # --- Configuration ---
 # These details should match your Qdrant setup
-QDRANT_URL = "https://6b25695f-de3c-4dbd-bb36-6de748ff47f2.us-east-1-0.aws.cloud.qdrant.io"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ug0KQAaAKM7Hv-L3NprJnvuLgNcNL9D9847dfWRL_Fk"
-COLLECTION_NAME = "arxiv_specter2_recommendations"
+
 FIELD_TO_INDEX = "arxiv_id"
 
 def setup_payload_index():

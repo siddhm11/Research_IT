@@ -4,9 +4,7 @@ import logging
 
 # --- Configuration ---
 # Ensure these match your main script and credentials
-QDRANT_URL = "https://6b25695f-de3c-4dbd-bb36-6de748ff47f2.us-east-1-0.aws.cloud.qdrant.io"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ug0KQAaAKM7Hv-L3NprJnvuLgNcNL9D9847dfWRL_Fk"
-COLLECTION_NAME = "arxiv_specter2_recommendations"
+
 
 def check_collection_indexes():
     """Connects to Qdrant and prints the payload index information for a collection."""

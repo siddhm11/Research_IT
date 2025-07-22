@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 # Your Qdrant Configuration
 
-MINILM_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
 TITLE_EMB_DIM         = 384
 
 # ArXiv API Configuration
@@ -62,33 +61,33 @@ class ArXivMetadataFetcher:
         if not arxiv_id:
             return arxiv_id
             
-        # Remove arxiv: prefix
+        # Remove prefix which is arxiv: ...
         arxiv_id = re.sub(r'^(arxiv:|arXiv:)', '', arxiv_id, flags=re.IGNORECASE)
         
-        # Remove version numbers
+        # there might be versions in arxivid which isnt imp 
         arxiv_id = re.sub(r'v\d+$', '', arxiv_id)
         
-        # Clean whitespace
+        # if space is there
         arxiv_id = arxiv_id.strip()
         
-        # FIX 1: Handle malformed IDs
-        if re.match(r'^\d{4}\.\d{4}$', arxiv_id):
-            # Already in correct new format (YYMM.NNNN)
+        # if bad arxiv id's since qdrant reduces the data with leading 0's and trailing 0's
+        if re.match(r'^\d{4}\.\d{4,5}$', arxiv_id):
+            # Already in correct format then no problem .. but i am missing the one with 4 inputs but should actually be 5 ###### imp problem 
             return arxiv_id
         elif re.match(r'^\d{4}\.\d{1,3}$', arxiv_id):
-            # New format but missing trailing zeros (e.g., 1609.786 -> 1609.0786)
             parts = arxiv_id.split('.')
             if len(parts[1]) < 4:
-                # Pad with trailing zeros
-                arxiv_id = f"{parts[0]}.{parts[1].zfill(4)}"
+                # Pad with leading 0's since now it become xxxx.11 to xxxx.1100
+                
+                arxiv_id = f"{parts[0]}.{parts[1] + {'0'*(4 - len(parts[1]))}}"
                 logger.info(f"🔧 Fixed ArXiv ID: {arxiv_id}")
         elif re.match(r'^\d{3}\.\d{4}$', arxiv_id):
-            # Old format missing leading zero (e.g., 904.3356 -> 0904.3356)
+            # adds trailing 0 to the LHS side 
             arxiv_id = f"0{arxiv_id}"
             logger.info(f"🔧 Fixed ArXiv ID: {arxiv_id}")
         elif re.match(r'^[a-z-]+/\d{7}$', arxiv_id):
             # Subject class format (e.g., math/9502222, cs/9301114)
-            # These are valid old format IDs
+            # old format thing 
             pass
         else:
             logger.warning(f"⚠️ Potentially invalid ArXiv ID format: {arxiv_id}")
@@ -103,7 +102,7 @@ class ArXivMetadataFetcher:
             cleaned = self._clean_arxiv_id(arxiv_id)
             
             # Check if ID looks valid
-            if (re.match(r'^\d{4}\.\d{4,5}$', cleaned) or # FIX: New format (YYMM.NNNN or YYMM.NNNNN) or  # New format
+            if (re.match(r'^\d{4}\.\d{4,5}$', cleaned) or # New format (YYMM.NNNN or YYMM.NNNNN) 
                 re.match(r'^[a-z-]+/\d{7}$', cleaned) or  # Old format with subject
                 re.match(r'^\d{7}$', cleaned)):  # Old format numeric only
                 valid_ids.append(cleaned)
@@ -151,6 +150,7 @@ class ArXivMetadataFetcher:
                 if term:
                     categories.append(term)
             
+            
             # Extract DOI (optional)
             doi = None
             for link in entry.findall('{http://www.w3.org/2005/Atom}link'):
@@ -186,6 +186,8 @@ class ArXivMetadataFetcher:
                 published="",
                 categories=[]
             )
+            
+            
     def fetch_batch_metadata(self, arxiv_ids: List[str]) -> Dict[str, PaperMetadata]:
         """Enhanced batch metadata fetching with better error handling"""
         results = {}
@@ -263,12 +265,13 @@ class ArXivMetadataFetcher:
                 results[arxiv_id] = self.cache[arxiv_id]
         
         return results
+    
+    
 class SPECTER2Search:
     def __init__(self):
         """Initialize SPECTER2 search system with metadata fetching"""
         self.model = None
         self.tokenizer = None
-        self.gpu_count = 0
         self.client = None
         self.metadata_fetcher = ArXivMetadataFetcher()
         self.title_model: Optional[SentenceTransformer] = None
@@ -276,25 +279,14 @@ class SPECTER2Search:
         self.collection_name = COLLECTION_NAME
         
         # Initialize components
-        self._setup_model()
-        self._setup_client()
-        self._setup_title_components()  # NEW: Combined title setup
-    
+        self._setup_model()             # specter2 download
+        self._setup_client()            # specter2 qdrant client
+        self._setup_title_components()  # minilm download and title only qdrant
+        
+    # specter2 download
     def _setup_model(self):
         """Setup SPECTER2 model optimized for inference"""
         logger.info("🔬 Setting up SPECTER2 model for search...")
-        
-        if torch.cuda.is_available():
-            self.gpu_count = torch.cuda.device_count()
-            logger.info(f"✓ CUDA available - GPUs: {self.gpu_count}")
-            for i in range(self.gpu_count):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
-                logger.info(f"  GPU {i}: {gpu_name} ({gpu_memory:.1f}GB VRAM)")
-        else:
-            logger.info("⚠️  No CUDA available, using CPU")
-            self.gpu_count = 0
-        
         try:
             logger.info("📥 Loading SPECTER2 base model...")
             self.tokenizer = AutoTokenizer.from_pretrained('allenai/specter2_base')
@@ -303,23 +295,12 @@ class SPECTER2Search:
             logger.info("🔧 Loading SPECTER2 proximity adapter...")
             self.model.load_adapter("allenai/specter2", source="hf", load_as="proximity", set_active=True)
             
-            if self.gpu_count > 1:
-                logger.info(f"🚀 Enabling DataParallel across {self.gpu_count} GPUs")
-                self.model = torch.nn.DataParallel(self.model)
-                self.model = self.model.to('cuda')
-                self.model.half()
-                logger.info("✅ SPECTER2 ready with multi-GPU support")
-            elif self.gpu_count == 1:
-                self.model = self.model.to('cuda')
-                self.model.half()
-                logger.info("✅ SPECTER2 ready with single GPU")
-            else:
-                logger.info("✅ SPECTER2 ready with CPU")
+            logger.info("✅ SPECTER2 ready with CPU")
             
         except Exception as e:
             logger.error(f"❌ Error loading SPECTER2: {e}")
             raise
-    
+    #specter2 on 
     def _setup_client(self):
         """Setup main Qdrant client"""
         try:
@@ -349,12 +330,8 @@ class SPECTER2Search:
             logger.info("🔬 Loading MiniLM title encoder...")
             self.title_model = SentenceTransformer(MINILM_MODEL_NAME)
             
-            if torch.cuda.is_available():
-                logger.info("🚀 Moving title model to CUDA...")
-                self.title_model = self.title_model.to("cuda").half()
-                logger.info("✅ Title model ready with CUDA")
-            else:
-                logger.info("⚠️ Title model using CPU")
+            
+            logger.info("✅ Title model using CPU")
                 
             logger.info("✅ MiniLM title model loaded successfully")
             
@@ -398,7 +375,7 @@ class SPECTER2Search:
             vec = self.title_model.encode(
                 text, 
                 convert_to_numpy=True,
-                device="cuda" if torch.cuda.is_available() else "cpu"
+                device="cpu"
             )
             return vec / np.linalg.norm(vec)
         except Exception as e:
@@ -515,23 +492,9 @@ class SPECTER2Search:
             return_token_type_ids=False
         )
         
-        if torch.cuda.is_available():
-            inputs = {k: v.to('cuda') for k, v in inputs.items()}
-            
-            if self.gpu_count > 1:
-                with torch.cuda.amp.autocast():
-                    with torch.no_grad():
-                        outputs = self.model(**inputs)
-                        query_embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()[0]
-            else:
-                with torch.cuda.amp.autocast():
-                    with torch.no_grad():
-                        outputs = self.model(**inputs)
-                        query_embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()[0]
-        else:
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                query_embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            query_embedding = outputs.last_hidden_state[:, 0, :].numpy()[0]
         
         query_embedding = query_embedding / np.linalg.norm(query_embedding)
         return query_embedding
@@ -724,7 +687,6 @@ class SPECTER2Search:
         """Pretty print search results with metadata and optionally vectors"""
         logger.info(f"🔍 SPECTER2 Results for: '{query_text}'")
         logger.info(f"⚡ Search completed in {search_time:.0f}ms {mode}")
-        logger.info(f"🚀 Using GPU*{self.gpu_count} optimization")
         logger.info(f"📊 Found {len(results)} papers")
         
         for i, result in enumerate(results, 1):

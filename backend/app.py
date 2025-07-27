@@ -173,8 +173,6 @@ async def health_check():
     return {
         "status": "healthy",
         "search_system": "ready",
-        "gpu_available": search_system.gpu_count > 0,
-        "gpu_count": search_system.gpu_count,
         "cached_papers": len(search_system.metadata_fetcher.cache)
     }
 

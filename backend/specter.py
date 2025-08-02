@@ -39,7 +39,6 @@ QDRANT_TITLE_API_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn
 TITLE_COLLECTION_NAME = "arxiv_papers_titles"
 MINILM_MODEL_NAME     = "sentence-transformers/all-MiniLM-L6-v2"
 TITLE_EMB_DIM         = 384
-
 # ArXiv API Configuration
 ARXIV_API_BASE = "http://export.arxiv.org/api/query"
 REQUEST_DELAY = 3.0

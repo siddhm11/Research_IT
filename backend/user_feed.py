@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
 import math
+import uuid
 from enum import Enum
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
@@ -14,10 +15,10 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-# Configuration - Updated for SPECTER2
-QDRANT_TITLE_URL = "https://ba0f9774-1b9e-4b0b-bb05-db8fadfe122c.eu-west-2-0.aws.cloud.qdrant.io"
-QDRANT_TITLE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.sMVFQwd_dg3z89uIih5r5olFlbXLAjl_Gcx0V5IJG-U"
-TITLE_COLLECTION_NAME = "arxiv_papers_titles"
+
+QDRANT_TITLE_URL = "https://6b25695f-de3c-4dbd-bb36-6de748ff47f2.us-east-1-0.aws.cloud.qdrant.io"
+QDRANT_TITLE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ug0KQAaAKM7Hv-L3NprJnvuLgNcNL9D9847dfWRL_Fk"
+TITLE_COLLECTION_NAME = "arxiv_specter2_recommendations"
 SPECTER2_MODEL_NAME = "allenai/specter2_base"  # Scientific paper embeddings
 EMBEDDING_DIM = 768  
 
@@ -106,7 +107,8 @@ class UserProfile:
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.embedding_dim = EMBEDDING_DIM
-        
+        # Store mapping for retrieval (you might want to persist this)
+
         # Qdrant client
         self.client = QdrantClient(
             url=QDRANT_TITLE_URL,
@@ -136,11 +138,19 @@ class UserProfile:
         }
         
         # Vector IDs in Qdrant
+        # Vector IDs in Qdrant (using UUIDs)
         self.vector_ids = {
-            VectorType.COMPLETE: f"user_{user_id}_complete",
-            VectorType.SUBJECT1: f"user_{user_id}_subject1",
-            VectorType.SUBJECT2: f"user_{user_id}_subject2",
-            VectorType.SUBJECT3: f"user_{user_id}_subject3"
+            VectorType.COMPLETE: str(uuid.uuid4()),
+            VectorType.SUBJECT1: str(uuid.uuid4()),
+            VectorType.SUBJECT2: str(uuid.uuid4()),  
+            VectorType.SUBJECT3: str(uuid.uuid4())
+        }
+
+        self.vector_id_mapping = {
+            "complete": self.vector_ids[VectorType.COMPLETE],
+            "subject1": self.vector_ids[VectorType.SUBJECT1], 
+            "subject2": self.vector_ids[VectorType.SUBJECT2],
+            "subject3": self.vector_ids[VectorType.SUBJECT3]
         }
         
         # Enhanced interaction tracking

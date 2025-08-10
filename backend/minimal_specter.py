@@ -84,7 +84,7 @@ class ArXivMetadataFetcher:
             if len(parts[1]) < 4:
                 # Pad with leading 0's since now it become xxxx.11 to xxxx.1100
                 
-                arxiv_id = f"{parts[0]}.{parts[1] + {'0'*(4 - len(parts[1]))}}"
+                arxiv_id = f"{parts[0]}.{parts[1] + '0'*(4 - len(parts[1]))}"
                 logger.info(f"🔧 Fixed ArXiv ID: {arxiv_id}")
         elif re.match(r'^\d{3}\.\d{4}$', arxiv_id):
             # adds trailing 0 to the LHS side 

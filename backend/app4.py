@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from qdrant_client import QdrantClient, models
 # Import your modules
 from minimal_specter import SPECTER2Search
-from user_feed import UserEmbeddingManager, InteractionType, UserProfile
+from user_feed import UserEmbeddingManager, InteractionType, UserProfile, VectorType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -890,79 +890,216 @@ async def find_similar_papers(request: SimilarityRequest, search_sys: SPECTER2Se
 
 # --- Feed Endpoints ---
 
+async def get_real_papers_for_user_feed(
+    user_profile: UserProfile, 
+    search_sys: SPECTER2Search,
+    count: int = 100
+) -> List[Dict]:
+    """Get real papers from Qdrant based on user preferences"""
+    
+    if not user_profile.is_onboarded:
+        # For non-onboarded users, get recent papers
+        try:
+            # Get random sample of papers from Qdrant
+            results = await asyncio.to_thread(
+                search_sys.client.scroll,
+                collection_name=search_sys.collection_name,
+                limit=count,
+                with_payload=True,
+                with_vectors=True
+            )
+            
+            papers = []
+            if results[0]:  # results is tuple (points, next_page_offset)
+                arxiv_ids = [r.payload.get('arxiv_id') for r in results[0] if r.payload.get('arxiv_id')]
+                
+                if arxiv_ids:
+                    metadata_dict = await asyncio.to_thread(
+                        search_sys.metadata_fetcher.fetch_batch_metadata,
+                        arxiv_ids
+                    )
+                    
+                    for point in results[0]:
+                        arxiv_id = point.payload.get('arxiv_id')
+                        if arxiv_id and arxiv_id in metadata_dict:
+                            paper_metadata = metadata_dict[arxiv_id]
+                            papers.append({
+                                'arxiv_id': arxiv_id,
+                                'title': paper_metadata.title,
+                                'abstract': paper_metadata.abstract,
+                                'authors': paper_metadata.authors,
+                                'categories': paper_metadata.categories,
+                                'published_date': paper_metadata.published,
+                                'vector': np.array(point.vector) if point.vector else None,
+                                'similarity_score': 0.8  # Default for trending
+                            })
+            return papers
+        except Exception as e:
+            logger.error(f"❌ Error getting trending papers: {e}")
+            return []
+    
+    # For onboarded users - get personalized papers
+    complete_vector = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+    
+    if complete_vector is None:
+        logger.warning("⚠️ No complete vector found, falling back to trending")
+        return await get_real_papers_for_user_feed(user_profile, search_sys, count)
+    
+    # Search for similar papers using user's preferences
+    try:
+        results = await asyncio.to_thread(
+            search_sys.client.search,
+            collection_name=search_sys.collection_name,
+            query_vector=complete_vector.astype(np.float32).tolist(),
+            limit=count,
+            search_params=models.SearchParams(hnsw_ef=64),
+            with_payload=True,
+            with_vectors=True
+        )
+        
+        # Convert to papers with metadata
+        papers = []
+        arxiv_ids = [r.payload.get('arxiv_id') for r in results if r.payload.get('arxiv_id')]
+        
+        if arxiv_ids:
+            metadata_dict = await asyncio.to_thread(
+                search_sys.metadata_fetcher.fetch_batch_metadata,
+                arxiv_ids
+            )
+            
+            for result in results:
+                arxiv_id = result.payload.get('arxiv_id')
+                if arxiv_id and arxiv_id in metadata_dict:
+                    paper_metadata = metadata_dict[arxiv_id]
+                    papers.append({
+                        'arxiv_id': arxiv_id,
+                        'title': paper_metadata.title,
+                        'abstract': paper_metadata.abstract,
+                        'authors': paper_metadata.authors,
+                        'categories': paper_metadata.categories,
+                        'published_date': paper_metadata.published,
+                        'vector': np.array(result.vector) if result.vector else None,
+                        'similarity_score': result.score
+                    })
+        
+        return papers
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting personalized papers: {e}")
+        return []
+
+
 @app.get("/users/{user_id}/feed", response_model=FeedResponse, tags=["Feed"])
 async def get_user_feed(
     user_id: str,
-    count: int = Query(20, ge=1, le=50, description="Number of papers to return"),
-    page: int = Query(1, ge=1, description="Page number"),
-    category: Optional[str] = Query(None, description="Filter by category"),
-    days_back: Optional[int] = Query(None, ge=1, le=365, description="Only papers from last N days"),
-    user_profile: UserProfile = Depends(get_user_profile)
+    count: int = Query(20, ge=1, le=50),
+    page: int = Query(1, ge=1),
+    category: Optional[str] = Query(None),
+    days_back: Optional[int] = Query(None),
+    user_profile: UserProfile = Depends(get_user_profile),
+    search_sys: SPECTER2Search = Depends(get_search_system)  # ADD THIS
 ):
-    """Get personalized paper feed for a user"""
+    """Get personalized paper feed using REAL papers from Qdrant"""
     try:
-        # Filter papers
-        filtered_papers = sample_papers.copy()
-        
+        # Get real papers based on user embeddings
+        candidate_papers = await get_real_papers_for_user_feed(
+            user_profile, 
+            search_sys, 
+            count=100  # Get more candidates for filtering
+        )
+        logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id}")
+        # Apply filters
+        if not candidate_papers:
+            logger.warning(f"❌ No candidate papers found for {user_id} , try fallback")
+            try:
+                fallback_results = await asyncio.to_thread(
+                    search_sys.client.scroll,
+                    collection_name=search_sys.collection_name,
+                    limit=50,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                
+                if fallback_results[0]:
+                    arxiv_ids = [r.payload.get('arxiv_id') for r in fallback_results[0] if r.payload.get('arxiv_id')]
+                    if arxiv_ids:
+                        metadata_dict = await asyncio.to_thread(
+                            search_sys.metadata_fetcher.fetch_batch_metadata,
+                            arxiv_ids[:50]
+                        )
+                        
+                        for result in fallback_results[0]:
+                            arxiv_id = result.payload.get('arxiv_id')
+                            if arxiv_id and arxiv_id in metadata_dict:
+                                paper_metadata = metadata_dict[arxiv_id]
+                                candidate_papers.append({
+                                    'arxiv_id': arxiv_id,
+                                    'title': paper_metadata.title,
+                                    'abstract': paper_metadata.abstract,
+                                    'authors': paper_metadata.authors,
+                                    'categories': paper_metadata.categories,
+                                    'published_date': paper_metadata.published,
+                                    'vector': np.array(result.vector) if result.vector else None,
+                                    'similarity_score': result.score
+                                })
+                logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id} from fallback")
+            except Exception as e:
+                logger.error(f"fall back failes: {e}")
+                
+                
+        filtered_papers = candidate_papers
         if category:
-            filtered_papers = [p for p in filtered_papers if category in p.categories]
+            filtered_papers = [p for p in filtered_papers if category in p.get('categories', [])]
         
         if days_back:
             cutoff_date = datetime.now() - timedelta(days=days_back)
-            filtered_papers = [p for p in filtered_papers if p.published_date >= cutoff_date]
-        
-        if not user_profile.is_onboarded:
-            # Return trending papers for non-onboarded users
-            trending_papers = sorted(
-                filtered_papers,
-                key=lambda p: p.view_count + p.bookmark_count * 3 + p.like_count * 5,
-                reverse=True
-            )[:count]
-            
-            feed = [
-                FeedPaper(
-                    arxiv_id=p.arxiv_id,
-                    title=p.title,
-                    abstract=p.abstract,
-                    authors=p.authors,
-                    categories=p.categories,
-                    published_date=p.published_date.isoformat(),
-                    recommendation_score=0.8,
-                    relevance_score=0.8,
-                    diversity_score=0.5,
-                    rank=i,
-                    recommendation_reason="Trending in community",
-                    stats={"views": p.view_count, "bookmarks": p.bookmark_count, "likes": p.like_count}
-                )
-                for i, p in enumerate(trending_papers)
+            filtered_papers = [
+                p for p in filtered_papers 
+                if datetime.fromisoformat(p['published_date'].split('T')[0]) >= cutoff_date
             ]
+        
+        # Generate personalized query for MMR
+        if user_profile.is_onboarded:
+            user_query = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+            if user_query is None:
+                user_query = np.random.normal(0, 0.3, 768)
+                user_query = user_query / np.linalg.norm(user_query)
             
-            return FeedResponse(
-                user_id=user_id,
-                feed=feed,
-                pagination={"page": page, "count": len(feed), "requested_count": count, "has_more": False},
-                user_context={"is_onboarded": False, "total_interactions": 0, "subjects": [], "subject_similarities": {}, "mmr_lambda": 0.7},
-                filters_applied={"category": category, "days_back": days_back, "total_papers_pool": len(filtered_papers)}
+            personalized_query = await asyncio.to_thread(
+                user_profile.get_personalized_query_vector_mmr,
+                user_query
             )
+        else:
+            # For non-onboarded users
+            personalized_query = np.random.normal(0, 0.3, 768)
+            personalized_query = personalized_query / np.linalg.norm(personalized_query)
         
-        # Generate personalized query (simulate user's general interests)
-        user_query = np.random.normal(0, 0.3, 768)
-        user_query = user_query / (np.linalg.norm(user_query) + 1e-8)
+        # Convert to SamplePaper-like objects for MMR
+        sample_like_papers = []
+        for paper in filtered_papers:
+            if paper.get('vector') is not None:
+                sample_paper = SamplePaper(
+                    arxiv_id=paper['arxiv_id'],
+                    title=paper['title'],
+                    abstract=paper['abstract'],
+                    authors=paper['authors'],
+                    categories=paper['categories'],
+                    published_date=datetime.fromisoformat(paper['published_date'].split('T')[0]),
+                    vector=paper['vector']
+                )
+                sample_like_papers.append(sample_paper)
         
-        # Get personalized query vector
-        personalized_query = await asyncio.to_thread(
-            user_profile.get_personalized_query_vector_mmr,
-            user_query
-        )
-        
-        # Apply MMR to get diverse, personalized results
-        feed_papers = apply_mmr_to_sample_papers(
-            filtered_papers[:100],  # Top 100 candidates
-            user_profile,
-            personalized_query,
-            user_profile.mmr_lambda,
-            count
-        )
+        # Apply MMR for diversity
+        if sample_like_papers:
+            feed_papers = apply_mmr_to_sample_papers(
+                sample_like_papers,
+                user_profile,
+                personalized_query,
+                user_profile.mmr_lambda,
+                count
+            )
+        else:
+            feed_papers = []
         
         # Apply pagination
         start_idx = (page - 1) * count
@@ -972,13 +1109,14 @@ async def get_user_feed(
         # User context
         user_stats = await asyncio.to_thread(user_profile.get_stats)
         subject_similarities = {}
-        if paginated_feed:
-            first_paper = next(p for p in sample_papers if p.arxiv_id == paginated_feed[0].arxiv_id)
+        if paginated_feed and user_profile.is_onboarded:
+            # Get first paper vector for subject similarity
+            first_paper = next(p for p in sample_like_papers if p.arxiv_id == paginated_feed[0].arxiv_id)
             subject_similarities = await asyncio.to_thread(
                 user_profile.get_subject_similarities,
                 first_paper.vector
             )
-        
+
         return FeedResponse(
             user_id=user_id,
             feed=paginated_feed,
@@ -998,13 +1136,70 @@ async def get_user_feed(
             filters_applied={
                 "category": category,
                 "days_back": days_back,
-                "total_papers_pool": len(filtered_papers)
+                "total_papers_pool": len(filtered_papers),
+                "using_real_data": True  # NEW FLAG
             }
         )
         
     except Exception as e:
-        logger.error(f"❌ Error generating feed for {user_id}: {e}", exc_info=True)
+        logger.error(f"❌ Error generating real paper feed for {user_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/user/{user_id}/vectors", tags=["Debug"])
+async def debug_user_vectors(
+    user_id: str,
+    user_profile: UserProfile = Depends(get_user_profile),
+    search_sys: SPECTER2Search = Depends(get_search_system)
+):
+    """Debug user vectors and search capability"""
+    try:
+        from user_feed import VectorType
+        
+        debug_info = {
+            "user_id": user_id,
+            "is_onboarded": user_profile.is_onboarded,
+            "vectors": {},
+            "search_test": {}
+        }
+        
+        # Get all user vectors
+        for vector_type in [VectorType.COMPLETE, VectorType.SUBJECT1, VectorType.SUBJECT2, VectorType.SUBJECT3]:
+            vector = user_profile._retrieve_vector_from_qdrant(vector_type)
+            debug_info["vectors"][vector_type.value] = {
+                "exists": vector is not None,
+                "shape": vector.shape if vector is not None else None,
+                "norm": float(np.linalg.norm(vector)) if vector is not None else None
+            }
+        
+        # Test search with complete vector
+        complete_vector = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+        if complete_vector is not None:
+            try:
+                test_results = await asyncio.to_thread(
+                    search_sys.client.search,
+                    collection_name=search_sys.collection_name,
+                    query_vector=complete_vector.astype(np.float32).tolist(),
+                    limit=10,
+                    search_params=models.SearchParams(hnsw_ef=32),
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                debug_info["search_test"] = {
+                    "results_found": len(test_results),
+                    "top_scores": [r.score for r in test_results[:3]],
+                    "arxiv_ids": [r.payload.get('arxiv_id') for r in test_results[:3]]
+                }
+            except Exception as e:
+                debug_info["search_test"] = {"error": str(e)}
+        
+        return debug_info
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @app.get("/papers/trending", response_model=TrendingResponse, tags=["Feed"])
 async def get_trending_papers(

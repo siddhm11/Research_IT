@@ -835,6 +835,31 @@ class UserProfile:
             logger.info(f"🧹 Cleaned up {removed_count} old interactions (>{days_threshold} days)")
         
         return removed_count
+    
+    def get_subject_personalized_query(self, base_vector: np.ndarray, 
+                                 vector_type: VectorType) -> np.ndarray:
+        """Generate subject-specific personalized query combining subject and complete vectors"""
+        subject_vector = self._retrieve_vector_from_qdrant(vector_type)
+        complete_vector = self._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+        
+        if subject_vector is None:
+            return base_vector
+        
+        # Weight combination for subject-specific search
+        subject_weight = 0.7  # High emphasis on specific subject
+        complete_weight = 0.2  # Some general preference influence
+        base_weight = 0.1     # Small influence from original query
+        
+        personalized = (
+            base_weight * base_vector +
+            subject_weight * subject_vector +
+            complete_weight * (complete_vector if complete_vector is not None else np.zeros_like(base_vector))
+        )
+        
+        # Normalize
+        norm = np.linalg.norm(personalized)
+        return personalized / norm if norm > 1e-8 else base_vector
+
 
 
 class UserEmbeddingManager:
@@ -1014,6 +1039,8 @@ class UserEmbeddingManager:
                     similarities_summary[user_id] = {"error": str(e)}
         
         return similarities_summary
+    
+    
 
 
 # Utility Functions
@@ -1084,6 +1111,8 @@ def analyze_mmr_performance(mmr_results: List[MMRResult]) -> Dict:
     }
     
     return analysis
+
+
 
 
 # Example Usage and Testing

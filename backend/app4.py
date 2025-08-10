@@ -590,6 +590,87 @@ def generate_recommendation_reason(user_profile: UserProfile, paper: SamplePaper
     ]
     return random.choice(reasons)
 
+def apply_mmr_to_papers(papers: List[Dict], user_profile: UserProfile,
+                       query_vector: np.ndarray, lambda_param: float = 0.7,
+                       max_results: int = 20) -> List[Dict]:
+    """Apply MMR ranking to real papers from Qdrant"""
+    if not papers:
+        return []
+
+    # Convert to vectors
+    result_vectors = []
+    for paper in papers:
+        if paper.get('vector') is not None:
+            result_vectors.append(paper['vector'])
+        else:
+            # Use dummy vector if no vector available
+            result_vectors.append(np.random.normal(0, 0.3, 768))
+    
+    if not result_vectors:
+        return []
+    
+    result_vectors = np.array(result_vectors)
+
+    # MMR Algorithm
+    selected_results = []
+    remaining_indices = list(range(len(papers)))
+    
+    for rank in range(min(max_results, len(papers))):
+        best_mmr_score = -float('inf')
+        best_idx = None
+
+        for idx in remaining_indices:
+            # Relevance score
+            relevance = np.dot(result_vectors[idx], query_vector)
+
+            # Diversity score
+            if selected_results:
+                # Get vectors of already selected papers
+                selected_vectors = [result_vectors[papers.index(next(p for p in papers if p['arxiv_id'] == selected_results[i]['arxiv_id']))] for i in range(len(selected_results))]
+                if selected_vectors:
+                    max_similarity = np.max([np.dot(result_vectors[idx], sv) for sv in selected_vectors])
+                else:
+                    max_similarity = 0.0
+            else:
+                max_similarity = 0.0
+
+            # MMR Score
+            mmr_score = lambda_param * relevance - (1 - lambda_param) * max_similarity
+
+            if mmr_score > best_mmr_score:
+                best_mmr_score = mmr_score
+                best_idx = idx
+
+        if best_idx is not None:
+            paper = papers[best_idx]
+            relevance_score = np.dot(result_vectors[best_idx], query_vector)
+            diversity_score = 1 - (max_similarity if selected_results else 0)
+
+            feed_paper = {
+                'arxiv_id': paper['arxiv_id'],
+                'title': paper['title'],
+                'abstract': paper['abstract'],
+                'authors': paper['authors'],
+                'categories': paper['categories'],
+                'published_date': paper['published_date'],
+                'recommendation_score': float(best_mmr_score),
+                'relevance_score': float(relevance_score),
+                'diversity_score': float(diversity_score),
+                'rank': rank,
+                'recommendation_reason': 'HI',
+                'stats': {
+                    'views': random.randint(10, 500),
+                    'bookmarks': random.randint(1, 50),
+                    'likes': random.randint(0, 20)
+                }
+            }
+
+            selected_results.append(feed_paper)
+            remaining_indices.remove(best_idx)
+
+    return selected_results
+
+
 def apply_mmr_to_sample_papers(papers: List[SamplePaper], user_profile: UserProfile, 
                               query_vector: np.ndarray, lambda_param: float = 0.7, 
                               max_results: int = 20) -> List[FeedPaper]:
@@ -1199,6 +1280,371 @@ async def debug_user_vectors(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+async def convert_search_results_to_papers(results, search_sys, limit):
+    """Convert Qdrant search results to paper objects"""
+    papers = []
+    arxiv_ids = [r.payload.get('arxiv_id') for r in results[:limit*2] if r.payload.get('arxiv_id')]
+    
+    if arxiv_ids:
+        metadata_dict = await asyncio.to_thread(
+            search_sys.metadata_fetcher.fetch_batch_metadata,
+            arxiv_ids
+        )
+        
+        for result in results[:limit*2]:
+            arxiv_id = result.payload.get('arxiv_id')
+            if arxiv_id and arxiv_id in metadata_dict:
+                paper_metadata = metadata_dict[arxiv_id]
+                papers.append({
+                    'arxiv_id': arxiv_id,
+                    'title': paper_metadata.title,
+                    'abstract': paper_metadata.abstract,
+                    'authors': paper_metadata.authors,
+                    'categories': paper_metadata.categories,
+                    'published_date': paper_metadata.published,
+                    'vector': np.array(result.vector) if result.vector else None,
+                    'similarity_score': result.score,
+                    'search_rank': len(papers)  # Track original search ranking
+                })
+                
+                if len(papers) >= limit:
+                    break
+    
+    return papers
+
+def apply_feed_merge_strategy(feed_sections: Dict, strategy: str, target_size: int) -> List[Dict]:
+    """Apply different strategies to merge feed sections"""
+    
+    if strategy == "separate":
+        # Return sections as-is, organized by vector type
+        return {
+            "presentation": "sections",
+            "sections": feed_sections
+        }
+    
+    elif strategy == "weighted":
+        # Merge based on vector strength and user engagement
+        all_papers = []
+        
+        for section_name, section in feed_sections.items():
+            vector_weight = 1.0  # Default weight
+            
+            if section_name == "complete_preferences":
+                vector_weight = 0.6  # Complete vector gets high base weight
+            elif "subject" in section_name:
+                # Weight based on subject engagement
+                subject_stats = section.get("subject_stats", {})
+                interaction_count = subject_stats.get("interaction_count", 1)
+                total_weight = subject_stats.get("total_weight", 0.1)
+                vector_weight = 0.3 + (total_weight / 10.0)  # Subject weight based on learning
+            
+            # Add weighted papers
+            for paper in section["papers"]:
+                paper_copy = paper.copy()
+                paper_copy["vector_source"] = section_name
+                paper_copy["vector_weight"] = vector_weight
+                paper_copy["weighted_score"] = paper["recommendation_score"] * vector_weight
+                all_papers.append(paper_copy)
+        
+        # Sort by weighted score and deduplicate
+        deduplicated_papers = deduplicate_papers(all_papers, key_field="weighted_score")
+        sorted_papers = sorted(deduplicated_papers, key=lambda x: x["weighted_score"], reverse=True)
+        
+        return {
+            "presentation": "unified",
+            "papers": sorted_papers[:target_size],
+            "merge_info": {
+                "total_before_dedup": len(all_papers),
+                "total_after_dedup": len(deduplicated_papers),
+                "final_count": len(sorted_papers[:target_size])
+            }
+        }
+    
+    else:  # interleaved (default)
+        # Interleave papers from different sections
+        section_iterators = {}
+        section_papers = {}
+        
+        for section_name, section in feed_sections.items():
+            papers = section["papers"]
+            section_papers[section_name] = papers
+            section_iterators[section_name] = 0
+        
+        interleaved_papers = []
+        rounds = 0
+        max_rounds = target_size // len(feed_sections) + 2
+        
+        while len(interleaved_papers) < target_size and rounds < max_rounds:
+            for section_name in feed_sections.keys():
+                if (len(interleaved_papers) >= target_size or 
+                    section_iterators[section_name] >= len(section_papers[section_name])):
+                    continue
+                
+                paper = section_papers[section_name][section_iterators[section_name]].copy()
+                paper["vector_source"] = section_name
+                paper["interleave_round"] = rounds
+                
+                # Check for duplicates
+                if not any(p["arxiv_id"] == paper["arxiv_id"] for p in interleaved_papers):
+                    interleaved_papers.append(paper)
+                
+                section_iterators[section_name] += 1
+            
+            rounds += 1
+        
+        return {
+            "presentation": "interleaved",
+            "papers": interleaved_papers,
+            "interleave_info": {
+                "rounds_completed": rounds,
+                "papers_per_section": {name: section_iterators[name] for name in feed_sections.keys()}
+            }
+        }
+
+def deduplicate_papers(papers: List[Dict], key_field: str = "recommendation_score") -> List[Dict]:
+    """Remove duplicate papers, keeping the one with highest score"""
+    seen_ids = set()
+    deduplicated = []
+    
+    # Sort by the key field to ensure we keep the best version
+    sorted_papers = sorted(papers, key=lambda x: x.get(key_field, 0), reverse=True)
+    
+    for paper in sorted_papers:
+        arxiv_id = paper["arxiv_id"]
+        if arxiv_id not in seen_ids:
+            seen_ids.add(arxiv_id)
+            deduplicated.append(paper)
+    
+    return deduplicated
+
+async def generate_cross_vector_analysis(feed_sections: Dict, user_profile: UserProfile, 
+                                       search_sys: SPECTER2Search) -> Dict:
+    """Analyze relationships and overlaps between different vector results"""
+    analysis = {
+        "vector_similarities": {},
+        "paper_overlaps": {},
+        "diversity_analysis": {},
+        "recommendations": []
+    }
+    
+    # 1. Calculate similarities between user vectors
+    user_vectors = {}
+    for vector_type in [VectorType.COMPLETE, VectorType.SUBJECT1, VectorType.SUBJECT2, VectorType.SUBJECT3]:
+        vector = user_profile._retrieve_vector_from_qdrant(vector_type)
+        if vector is not None:
+            user_vectors[vector_type.value] = vector
+    
+    # Calculate pairwise similarities
+    vector_names = list(user_vectors.keys())
+    for i, vec1_name in enumerate(vector_names):
+        for j, vec2_name in enumerate(vector_names):
+            if i < j:
+                vec1 = user_vectors[vec1_name]
+                vec2 = user_vectors[vec2_name]
+                similarity = float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+                
+                pair_key = f"{vec1_name}_vs_{vec2_name}"
+                analysis["vector_similarities"][pair_key] = {
+                    "similarity": similarity,
+                    "interpretation": (
+                        "High overlap" if similarity > 0.7 else
+                        "Moderate overlap" if similarity > 0.4 else
+                        "Distinct interests"
+                    )
+                }
+    
+    # 2. Analyze paper overlaps between sections
+    section_papers = {}
+    for section_name, section in feed_sections.items():
+        paper_ids = {paper["arxiv_id"] for paper in section["papers"]}
+        section_papers[section_name] = paper_ids
+    
+    section_names = list(section_papers.keys())
+    for i, sect1 in enumerate(section_names):
+        for j, sect2 in enumerate(section_names):
+            if i < j:
+                overlap = len(section_papers[sect1] & section_papers[sect2])
+                total_unique = len(section_papers[sect1] | section_papers[sect2])
+                
+                overlap_key = f"{sect1}_vs_{sect2}"
+                analysis["paper_overlaps"][overlap_key] = {
+                    "overlap_count": overlap,
+                    "overlap_percentage": overlap / max(len(section_papers[sect1]), 1) * 100,
+                    "total_unique_papers": total_unique
+                }
+    
+    # 3. Diversity analysis
+    all_papers = []
+    for section in feed_sections.values():
+        all_papers.extend(section["papers"])
+    
+    unique_papers = len(set(paper["arxiv_id"] for paper in all_papers))
+    total_papers = len(all_papers)
+    
+    analysis["diversity_analysis"] = {
+        "total_papers_found": total_papers,
+        "unique_papers": unique_papers,
+        "duplication_rate": (total_papers - unique_papers) / max(total_papers, 1) * 100,
+        "diversity_score": unique_papers / max(total_papers, 1) * 100
+    }
+    
+    # 4. Generate recommendations
+    if analysis["diversity_analysis"]["duplication_rate"] > 50:
+        analysis["recommendations"].append("High overlap detected - consider diversifying research interests")
+    
+    if len([sim for sim in analysis["vector_similarities"].values() if sim["similarity"] > 0.8]) > 1:
+        analysis["recommendations"].append("Some research areas are very similar - you might want to explore new fields")
+    
+    strongest_section = max(feed_sections.keys(), 
+                          key=lambda x: len(feed_sections[x]["papers"]))
+    analysis["recommendations"].append(f"Strongest interest area: {feed_sections[strongest_section]['title']}")
+    
+    return analysis
+
+
+
+@app.get("/users/{user_id}/feed/multi-vector", response_model=Dict, tags=["Feed"])
+async def get_multi_vector_feed(
+    user_id: str,
+    papers_per_vector: int = Query(15, ge=5, le=30),
+    include_complete: bool = Query(True, description="Include complete vector results"),
+    include_subjects: bool = Query(True, description="Include subject vector results"),
+    merge_strategy: str = Query("interleaved", pattern="^(interleaved|separate|weighted)$"),
+    user_profile: UserProfile = Depends(get_user_profile),
+    search_sys: SPECTER2Search = Depends(get_search_system)
+):
+    """Get feed using multiple user vectors (complete + subjects) with flexible presentation"""
+    try:
+        if not user_profile.is_onboarded:
+            raise HTTPException(status_code=400, detail="User must be onboarded for multi-vector feeds")
+        
+        feed_sections = {}
+        vector_info = {}
+        
+        # 1. Get papers using COMPLETE vector
+        if include_complete:
+            complete_vector = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+            if complete_vector is not None:
+                logger.info(f"🎯 Searching with COMPLETE vector for {user_id}")
+                
+                complete_results = await asyncio.to_thread(
+                    search_sys.client.search,
+                    collection_name=search_sys.collection_name,
+                    query_vector=complete_vector.astype(np.float32).tolist(),
+                    limit=papers_per_vector * 2,  # Get more for filtering
+                    search_params=models.SearchParams(hnsw_ef=64),
+                    with_payload=True,
+                    with_vectors=True
+                )
+                
+                complete_papers = await convert_search_results_to_papers(
+                    complete_results, search_sys, papers_per_vector
+                )
+                
+                # Apply MMR to complete vector results
+                complete_query = await asyncio.to_thread(
+                    user_profile.get_personalized_query_vector_mmr,
+                    complete_vector
+                )
+                
+                feed_sections["complete_preferences"] = {
+                    "title": "Overall Recommendations",
+                    "description": "Papers matching your general research interests",
+                    "vector_type": "complete",
+                    "papers": apply_mmr_to_papers(
+                        complete_papers, user_profile, complete_query, 
+                        user_profile.mmr_lambda, papers_per_vector
+                    )
+                }
+                
+                vector_info["complete"] = {
+                    "vector_norm": float(np.linalg.norm(complete_vector)),
+                    "papers_found": len(complete_papers),
+                    "search_quality": "high" if len(complete_papers) >= papers_per_vector else "partial"
+                }
+        
+        # 2. Get papers using SUBJECT vectors
+        if include_subjects:
+            for vector_type in [VectorType.SUBJECT1, VectorType.SUBJECT2, VectorType.SUBJECT3]:
+                subject = user_profile.subjects[vector_type]
+                subject_vector = user_profile._retrieve_vector_from_qdrant(vector_type)
+                
+                if subject_vector is not None:
+                    logger.info(f"🔬 Searching with {subject.name} vector")
+                    
+                    subject_results = await asyncio.to_thread(
+                        search_sys.client.search,
+                        collection_name=search_sys.collection_name,
+                        query_vector=subject_vector.astype(np.float32).tolist(),
+                        limit=papers_per_vector * 2,
+                        search_params=models.SearchParams(hnsw_ef=64),
+                        with_payload=True,
+                        with_vectors=True
+                    )
+                    
+                    subject_papers = await convert_search_results_to_papers(
+                        subject_results, search_sys, papers_per_vector
+                    )
+                    
+                    # Generate subject-specific personalized query
+                    subject_query = await asyncio.to_thread(
+                        user_profile.get_subject_personalized_query,
+                        subject_vector, vector_type
+                    )
+                    
+                    section_key = f"subject_{vector_type.value}"
+                    feed_sections[section_key] = {
+                        "title": f"{subject.name} Focus",
+                        "description": f"Papers specifically related to {subject.name}",
+                        "vector_type": vector_type.value,
+                        "subject_name": subject.name,
+                        "papers": apply_mmr_to_papers(
+                            subject_papers, user_profile, subject_query,
+                            user_profile.mmr_lambda, papers_per_vector
+                        ),
+                        "subject_stats": {
+                            "interaction_count": subject.interaction_count,
+                            "total_weight": subject.total_weight_accumulated,
+                            "last_updated": subject.last_updated.isoformat(),
+                            "keywords": subject.keywords
+                        }
+                    }
+                    
+                    vector_info[vector_type.value] = {
+                        "vector_norm": float(np.linalg.norm(subject_vector)),
+                        "papers_found": len(subject_papers),
+                        "subject_strength": subject.total_weight_accumulated,
+                        "search_quality": "high" if len(subject_papers) >= papers_per_vector else "partial"
+                    }
+        
+        # 3. Apply merge strategy
+        final_feed = apply_feed_merge_strategy(feed_sections, merge_strategy, papers_per_vector)
+        
+        # 4. Generate cross-vector analysis
+        cross_vector_analysis = await generate_cross_vector_analysis(
+            feed_sections, user_profile, search_sys
+        )
+        
+        return {
+            "user_id": user_id,
+            "feed_type": "multi_vector",
+            "merge_strategy": merge_strategy,
+            "feed_sections": feed_sections,
+            "merged_feed": final_feed,
+            "vector_analysis": vector_info,
+            "cross_vector_insights": cross_vector_analysis,
+            "feed_metadata": {
+                "papers_per_vector": papers_per_vector,
+                "total_sections": len(feed_sections),
+                "total_papers": sum(len(section["papers"]) for section in feed_sections.values()),
+                "generation_time": datetime.now().isoformat(),
+                "user_onboarded_at": user_profile.created_at.isoformat()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error generating multi-vector feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/papers/trending", response_model=TrendingResponse, tags=["Feed"])

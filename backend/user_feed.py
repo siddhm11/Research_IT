@@ -12,6 +12,7 @@ from enum import Enum
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import uuid
+from minimal_db import SimpleUserDB
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,9 @@ class MMRResult:
 class UserProfile:
     """Enhanced user profile with SPECTER2, decay learning, and MMR"""
     
-    def __init__(self, user_id: str):
+    def __init__(self, user_id: str, db):
         self.user_id = user_id
+        self.db = db
         self.embedding_dim = EMBEDDING_DIM
         # Store mapping for retrieval (you might want to persist this)
 
@@ -116,6 +118,7 @@ class UserProfile:
             timeout=120
         )
         
+        self.vector_ids=self._get_or_create_uuids()
         # SPECTER2 model for scientific papers
         try:
             self.specter_model = SentenceTransformer(SPECTER2_MODEL_NAME)
@@ -135,15 +138,6 @@ class UserProfile:
             VectorType.SUBJECT1: UserSubject("Machine Learning", f"user_{user_id}_subject1"),
             VectorType.SUBJECT2: UserSubject("Computer Vision", f"user_{user_id}_subject2"), 
             VectorType.SUBJECT3: UserSubject("Natural Language Processing", f"user_{user_id}_subject3")
-        }
-        
-        # Vector IDs in Qdrant
-        # Vector IDs in Qdrant (using UUIDs)
-        self.vector_ids = {
-            VectorType.COMPLETE: str(uuid.uuid4()),
-            VectorType.SUBJECT1: str(uuid.uuid4()),
-            VectorType.SUBJECT2: str(uuid.uuid4()),  
-            VectorType.SUBJECT3: str(uuid.uuid4())
         }
 
         self.vector_id_mapping = {
@@ -217,6 +211,25 @@ class UserProfile:
         except Exception as e:
             logger.error(f"❌ Failed to store {vector_type.value} vector: {e}")
             raise
+    
+    def _get_or_create_uuids(self) -> Dict[VectorType, str]:
+        """Get existing UUIDs or create new ones"""
+        existing_uuids = self.db.get_user_uuids(self.user_id)
+        
+        if existing_uuids:
+            print(f"✅ Restored UUIDs for {self.user_id}")
+            return existing_uuids
+        else:
+            new_uuids = {
+                VectorType.COMPLETE: str(uuid.uuid4()),
+                VectorType.SUBJECT1: str(uuid.uuid4()),
+                VectorType.SUBJECT2: str(uuid.uuid4()),
+                VectorType.SUBJECT3: str(uuid.uuid4())
+            }
+            self.db.save_user_uuids(self.user_id, new_uuids)
+            print(f"🆕 Created new UUIDs for {self.user_id}")
+            return new_uuids
+    
     
     def _retrieve_vector_from_qdrant(self, vector_type: VectorType) -> Optional[np.ndarray]:
         """Retrieve user vector from Qdrant"""
@@ -865,9 +878,10 @@ class UserProfile:
 class UserEmbeddingManager:
     """Manages multiple user profiles with enhanced features"""
     
-    def __init__(self):
+    def __init__(self , db_path: str ="users.db"):
         self.users: Dict[str, UserProfile] = {}
-        logger.info("👥 Enhanced UserEmbeddingManager initialized with SPECTER2 support")
+        self.db = SimpleUserDB(db_path)
+        logger.info("👥  UserEmbeddingManager with storage")
     
     def create_user(self, user_id: Optional[str] = None) -> UserProfile:
         """Create a new user profile"""
@@ -878,7 +892,7 @@ class UserEmbeddingManager:
         if user_id in self.users:
             raise ValueError(f"User {user_id} already exists")
         
-        user_profile = UserProfile(user_id)
+        user_profile = UserProfile(user_id , self.db)
         self.users[user_id] = user_profile
         
         logger.info(f"👤 Created new user: {user_id}")
@@ -891,7 +905,7 @@ class UserEmbeddingManager:
     def get_or_create_user(self, user_id: str) -> UserProfile:
         """Get existing user or create new one"""
         if user_id not in self.users:
-            user_profile = UserProfile(user_id)
+            user_profile = UserProfile(user_id , self.db)
             self.users[user_id] = user_profile
             return user_profile
         return self.users[user_id]

@@ -11,13 +11,13 @@ from contextlib import asynccontextmanager
 import logging
 import time
 import random
-import uuid
 from datetime import datetime, timedelta
 from qdrant_client import QdrantClient, models
 # Import your modules
 from minimal_specter import SPECTER2Search
-from user_feed import UserEmbeddingManager, InteractionType, UserProfile, VectorType
-
+from user_feed import UserEmbeddingManager, InteractionType, UserProfile
+from user_types import VectorType
+from user_mapping import get_or_create_uuid, get_uuid
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -327,21 +327,25 @@ async def create_realistic_demo_users(user_mgr: UserEmbeddingManager, search_sys
 @asynccontextmanager
 async def lifespan(app2: FastAPI):
     """Initialize systems on startup and clean up on shutdown."""
-    global search_system, user_manager, sample_papers
-    logger.info("🚀 Starting SPECTER2 Search System with User Management & Feed...")
+    global search_system, user_manager
+    logger.info("🚀 Starting SPECTER2 Search System with User Storage..")
     try:
         # Initialize search system
         search_system = SPECTER2Search()
         logger.info("✅ SPECTER2 Search System initialized")
         
         # Initialize user management
-        user_manager = UserEmbeddingManager()
+        user_manager = UserEmbeddingManager(db_path = "users.db")
         logger.info("✅ User Management System initialized")
         
-        # Generate sample data for demo
-        logger.info("🔄 Generating sample data...")
-        await create_realistic_demo_users(user_manager, search_system)
-        logger.info(f"✅ Generated {len(sample_papers)} sample papers and demo users")
+        demo_user_count = len(user_manager.list_users())
+        if demo_user_count == 0:  # Only create if no users exist
+            logger.info("🎭 Creating demo users...")
+            await create_realistic_demo_users(user_manager, search_system)
+            logger.info(f"✅ Demo users created successfully")
+        else:
+            logger.info(f"📊 Found {demo_user_count} existing users, skipping demo creation")
+        
         
         yield
     except Exception as e:
@@ -2155,7 +2159,6 @@ async def get_demo_users(user_mgr: UserEmbeddingManager = Depends(get_user_manag
         "total_users": len(user_mgr.users)
     }
 
-# --- Run the application ---
 
 if __name__ == "__main__":
     uvicorn.run(

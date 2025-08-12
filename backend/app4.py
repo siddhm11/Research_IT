@@ -335,17 +335,22 @@ async def lifespan(app2: FastAPI):
         logger.info("✅ SPECTER2 Search System initialized")
         
         # Initialize user management
-        user_manager = UserEmbeddingManager(db_path = "users.db")
+        from pathlib import Path
+        DB_PATH = r"C:/Users/siddh/_code_/Research_IT/backend/users.db"
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)   # directory safety
+        user_manager = UserEmbeddingManager(db_path=DB_PATH)
         logger.info("✅ User Management System initialized")
         
+        # in app.py lifespan():
         demo_user_count = len(user_manager.list_users())
-        if demo_user_count == 0:  # Only create if no users exist
-            logger.info("🎭 Creating demo users...")
-            await create_realistic_demo_users(user_manager, search_system)
-            logger.info(f"✅ Demo users created successfully")
-        else:
-            logger.info(f"📊 Found {demo_user_count} existing users, skipping demo creation")
-        
+
+        # Force skip demo creation
+        logger.info(f"📊 Found {demo_user_count} users (skipping demo creation)")
+        # if demo_user_count == 0:
+        #     logger.info("🎭 Creating demo users...")
+        #     await create_realistic_demo_users(user_manager, search_system)
+        #     logger.info(f"✅ Demo users created successfully")
+
         
         yield
     except Exception as e:

@@ -13,6 +13,8 @@ from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 import uuid
 from minimal_db import SimpleUserDB
+from user_types import VectorType 
+
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +37,6 @@ class InteractionType(Enum):
     VIEW = "view"
     BOOKMARK = "bookmark"
 
-class VectorType(Enum):
-    """Four user vector types"""
-    COMPLETE = "complete"
-    SUBJECT1 = "subject1"
-    SUBJECT2 = "subject2"  
-    SUBJECT3 = "subject3"
 
 @dataclass
 class Interaction:
@@ -881,7 +877,12 @@ class UserEmbeddingManager:
     def __init__(self , db_path: str ="users.db"):
         self.users: Dict[str, UserProfile] = {}
         self.db = SimpleUserDB(db_path)
+        self._hydrate_from_sqlite()   # ← add this
         logger.info("👥  UserEmbeddingManager with storage")
+
+    def _hydrate_from_sqlite(self):
+        for user_id in self.db.list_all_user_ids():
+            self.users[user_id] = UserProfile(user_id, self.db)
     
     def create_user(self, user_id: Optional[str] = None) -> UserProfile:
         """Create a new user profile"""

@@ -2,7 +2,7 @@
 """
 initialize_users.py
 
-Sync demo users into users.db and into Qdrant as user vectors.
+Sync demo users into users1.db and into Qdrant as user vectors.
 
 Usage:
     python initialize_users.py
@@ -172,7 +172,8 @@ async def main():
         return
 
     # Init local user manager (SQLite)
-    user_mgr = UserEmbeddingManager(db_path="users.db")
+    DB_PATH = r"C:/Users/siddh/_code_/Research_IT/backend/users.db"
+    user_mgr = UserEmbeddingManager(db_path=DB_PATH)
 
     # If you have SPECTER2Search and want to use it for any extra steps:
     # specter = SPECTER2Search()   # not required for basic vector copying
@@ -182,7 +183,7 @@ async def main():
         field = profile["field"]
         subjects = profile["subjects"]
 
-        # 1) Guarantee a UUID is present in users.db for this username
+        # 1) Guarantee a UUID is present in users1.db for this username
         # get_or_create_uuid should return the UUID string for this username
         try:
             uuid = get_or_create_uuid(username)

@@ -152,6 +152,14 @@ class UserProfile:
         self.created_at = datetime.now()
         self.last_active = datetime.now()
         
+        # In user_feed.py, inside the UserProfile class __init__ method
+
+
+        if self._retrieve_vector_from_qdrant(VectorType.COMPLETE) is not None:
+            self.is_onboarded = True
+            logger.info(f"✅ User {self.user_id} is already onboarded (found existing vectors).")
+        
+        logger.info(f"🆕 Created enhanced user profile for {user_id}")
         logger.info(f"🆕 Created enhanced user profile for {user_id}")
     
     def _generate_embedding(self, text: str) -> np.ndarray:

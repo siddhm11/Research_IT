@@ -689,29 +689,29 @@ async def get_real_papers_for_user_feed(
         logger.error(f"❌ Error getting personalized papers: {e}")
         return []
 
-
 @app.get("/users/{user_id}/feed", response_model=FeedResponse, tags=["Feed"])
 async def get_user_feed(
     user_id: str,
-    count: int = Query(20, ge=1, le=50),
+    count: int = Query(10, ge=1, le=50),
     page: int = Query(1, ge=1),
     category: Optional[str] = Query(None),
     days_back: Optional[int] = Query(None),
     user_profile: UserProfile = Depends(get_user_profile),
-    search_sys: SPECTER2Search = Depends(get_search_system)  # ADD THIS
+    search_sys: SPECTER2Search = Depends(get_search_system)
 ):
     """Get personalized paper feed using REAL papers from Qdrant"""
     try:
-        # Get real papers based on user embeddings
+        # 1. Get a LARGE candidate pool from the database. This is for server-side ranking.
         candidate_papers = await get_real_papers_for_user_feed(
             user_profile, 
             search_sys, 
-            count=100  # Get more candidates for filtering
+            count=100  # Fetch 100 candidates to ensure a diverse selection for MMR
         )
         logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id}")
-        # Apply filters
+        
+        # Fallback logic if no candidates are found
         if not candidate_papers:
-            logger.warning(f"❌ No candidate papers found for {user_id} , try fallback")
+            logger.warning(f"❌ No candidate papers found for {user_id}, trying fallback")
             try:
                 fallback_results = await asyncio.to_thread(
                     search_sys.client.scroll,
@@ -741,13 +741,13 @@ async def get_user_feed(
                                     'categories': paper_metadata.categories,
                                     'published_date': paper_metadata.published,
                                     'vector': np.array(result.vector) if result.vector else None,
-                                    'similarity_score': result.score
+                                    'similarity_score': 0.0 # Score not relevant for fallback
                                 })
                 logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id} from fallback")
             except Exception as e:
-                logger.error(f"fall back failes: {e}")
+                logger.error(f"Fallback failed: {e}")
                 
-                
+        # 2. Apply any user-specified filters
         filtered_papers = candidate_papers
         if category:
             filtered_papers = [p for p in filtered_papers if category in p.get('categories', [])]
@@ -759,55 +759,50 @@ async def get_user_feed(
                 if datetime.fromisoformat(p['published_date'].split('T')[0]) >= cutoff_date
             ]
         
-        # Generate personalized query for MMR
+        # 3. Generate a personalized query vector for ranking
         if user_profile.is_onboarded:
             user_query = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
             if user_query is None:
                 user_query = np.random.normal(0, 0.3, 768)
-                user_query = user_query / np.linalg.norm(user_query)
+                user_query /= np.linalg.norm(user_query)
             
             personalized_query = await asyncio.to_thread(
                 user_profile.get_personalized_query_vector_mmr,
                 user_query
             )
         else:
-            # For non-onboarded users
             personalized_query = np.random.normal(0, 0.3, 768)
-            personalized_query = personalized_query / np.linalg.norm(personalized_query)
-        
-        # Convert to SamplePaper-like objects for MMR
-        # FIX for get_user_feed()
+            personalized_query /= np.linalg.norm(personalized_query)
 
-        # Apply MMR for diversity using the correct function
+        # 4. Apply MMR to re-rank the ENTIRE filtered pool for diversity and relevance
         if filtered_papers:
             feed_papers = apply_mmr_to_papers(
                 filtered_papers,
                 user_profile,
                 personalized_query,
                 user_profile.mmr_lambda,
-                count
+                max_results=len(filtered_papers) # Rank all available papers
             )
         else:
             feed_papers = []
-        # Apply pagination
+
+        # 5. Apply pagination AFTER ranking to get the specific page requested
         start_idx = (page - 1) * count
         end_idx = start_idx + count
         paginated_feed = feed_papers[start_idx:end_idx]
         
-        # User context
+        # User context calculation
         user_stats = await asyncio.to_thread(user_profile.get_stats)
         subject_similarities = {}
-        # FIX for get_user_feed()
-
         if paginated_feed and user_profile.is_onboarded:
-            # Find the full paper dictionary from the original filtered list
             first_paper_dict = next((p for p in filtered_papers if p['arxiv_id'] == paginated_feed[0]['arxiv_id']), None)
             if first_paper_dict and first_paper_dict.get('vector') is not None:
                 subject_similarities = await asyncio.to_thread(
                     user_profile.get_subject_similarities,
-                    first_paper_dict['vector'] # Access the vector via its key
+                    first_paper_dict['vector']
                 )
 
+        # 6. Return only the paginated slice to the user
         return FeedResponse(
             user_id=user_id,
             feed=paginated_feed,
@@ -815,7 +810,7 @@ async def get_user_feed(
                 "page": page,
                 "count": len(paginated_feed),
                 "requested_count": count,
-                "has_more": len(feed_papers) > end_idx
+                "has_more": len(feed_papers) > end_idx # Check against the full ranked list
             },
             user_context={
                 "is_onboarded": user_profile.is_onboarded,
@@ -828,14 +823,15 @@ async def get_user_feed(
                 "category": category,
                 "days_back": days_back,
                 "total_papers_pool": len(filtered_papers),
-                "using_real_data": True  # NEW FLAG
+                "using_real_data": True
             }
         )
         
     except Exception as e:
         logger.error(f"❌ Error generating real paper feed for {user_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+    
 
 @app.get("/debug/user/{user_id}/vectors", tags=["Debug"])
 async def debug_user_vectors(

@@ -689,149 +689,135 @@ async def get_real_papers_for_user_feed(
         logger.error(f"❌ Error getting personalized papers: {e}")
         return []
 
+async def get_ranked_paper_ids(
+    user_profile: UserProfile, 
+    search_sys: SPECTER2Search,
+    candidate_count: int = 100
+) -> List[str]:
+    """
+    Performs a fast Qdrant search to get candidate vectors and then runs MMR
+    to return a final, ranked list of ArXiv IDs. This function does NOT
+    fetch any metadata from the external ArXiv API.
+    """
+    # 1. Get the user's "taste profile" vector
+    user_query = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
+    if user_query is None:
+        logger.warning(f"User {user_profile.user_id} has no query vector. Returning empty list.")
+        return []
+
+    # 2. Get 100 candidate papers (ID and Vector only) from Qdrant. This is fast.
+    qdrant_results = await asyncio.to_thread(
+        search_sys.client.search,
+        collection_name=search_sys.collection_name,
+        query_vector=user_query.astype(np.float32).tolist(),
+        limit=candidate_count,
+        with_payload=True,
+        with_vectors=True  # Crucially, we get the vectors here
+    )
+
+    # 3. Prepare the list for the MMR algorithm.
+    # The MMR function needs a list of dictionaries with specific keys.
+    papers_for_mmr = [
+        {
+            # Required for MMR calculation:
+            "arxiv_id": result.payload.get("arxiv_id"),
+            "vector": np.array(result.vector),
+            # Dummy data to match the function's expected input shape:
+            "title": "", "abstract": "", "authors": [], "categories": [], "published_date": ""
+        }
+        for result in qdrant_results if result.payload.get("arxiv_id") and result.vector
+    ]
+
+    if not papers_for_mmr:
+        return []
+
+    # 4. Run MMR on the data with vectors to get the perfectly ranked list.
+    ranked_papers = apply_mmr_to_papers(
+        papers_for_mmr,
+        user_profile,
+        user_query,
+        user_profile.mmr_lambda,
+        max_results=len(papers_for_mmr)
+    )
+
+    # 5. Extract and return just the final, ranked list of ArXiv IDs.
+    ranked_ids = [p['arxiv_id'] for p in ranked_papers]
+    return ranked_ids
+
 @app.get("/users/{user_id}/feed", response_model=FeedResponse, tags=["Feed"])
 async def get_user_feed(
     user_id: str,
     count: int = Query(10, ge=1, le=50),
     page: int = Query(1, ge=1),
-    category: Optional[str] = Query(None),
-    days_back: Optional[int] = Query(None),
     user_profile: UserProfile = Depends(get_user_profile),
     search_sys: SPECTER2Search = Depends(get_search_system)
 ):
-    """Get personalized paper feed using REAL papers from Qdrant"""
+    """
+    Get a personalized paper feed using the OPTIMIZED workflow:
+    Rank first, then fetch metadata for only the required page.
+    """
     try:
-        # 1. Get a LARGE candidate pool from the database. This is for server-side ranking.
-        candidate_papers = await get_real_papers_for_user_feed(
-            user_profile, 
-            search_sys, 
-            count=100  # Fetch 100 candidates to ensure a diverse selection for MMR
-        )
-        logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id}")
+        # 1. FAST: Get the full list of ~100 paper IDs, already ranked by MMR.
+        ranked_ids = await get_ranked_paper_ids(user_profile, search_sys)
         
-        # Fallback logic if no candidates are found
-        if not candidate_papers:
-            logger.warning(f"❌ No candidate papers found for {user_id}, trying fallback")
-            try:
-                fallback_results = await asyncio.to_thread(
-                    search_sys.client.scroll,
-                    collection_name=search_sys.collection_name,
-                    limit=50,
-                    with_payload=True,
-                    with_vectors=True,
-                )
-                
-                if fallback_results[0]:
-                    arxiv_ids = [r.payload.get('arxiv_id') for r in fallback_results[0] if r.payload.get('arxiv_id')]
-                    if arxiv_ids:
-                        metadata_dict = await asyncio.to_thread(
-                            search_sys.metadata_fetcher.fetch_batch_metadata,
-                            arxiv_ids[:50]
-                        )
-                        
-                        for result in fallback_results[0]:
-                            arxiv_id = result.payload.get('arxiv_id')
-                            if arxiv_id and arxiv_id in metadata_dict:
-                                paper_metadata = metadata_dict[arxiv_id]
-                                candidate_papers.append({
-                                    'arxiv_id': arxiv_id,
-                                    'title': paper_metadata.title,
-                                    'abstract': paper_metadata.abstract,
-                                    'authors': paper_metadata.authors,
-                                    'categories': paper_metadata.categories,
-                                    'published_date': paper_metadata.published,
-                                    'vector': np.array(result.vector) if result.vector else None,
-                                    'similarity_score': 0.0 # Score not relevant for fallback
-                                })
-                logger.info(f"📋 Retrieved {len(candidate_papers)} candidate papers for {user_id} from fallback")
-            except Exception as e:
-                logger.error(f"Fallback failed: {e}")
-                
-        # 2. Apply any user-specified filters
-        filtered_papers = candidate_papers
-        if category:
-            filtered_papers = [p for p in filtered_papers if category in p.get('categories', [])]
-        
-        if days_back:
-            cutoff_date = datetime.now() - timedelta(days=days_back)
-            filtered_papers = [
-                p for p in filtered_papers 
-                if datetime.fromisoformat(p['published_date'].split('T')[0]) >= cutoff_date
-            ]
-        
-        # 3. Generate a personalized query vector for ranking
-        if user_profile.is_onboarded:
-            user_query = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
-            if user_query is None:
-                user_query = np.random.normal(0, 0.3, 768)
-                user_query /= np.linalg.norm(user_query)
-            
-            personalized_query = await asyncio.to_thread(
-                user_profile.get_personalized_query_vector_mmr,
-                user_query
-            )
-        else:
-            personalized_query = np.random.normal(0, 0.3, 768)
-            personalized_query /= np.linalg.norm(personalized_query)
+        if not ranked_ids:
+            return FeedResponse(user_id=user_id, feed=[], pagination={}, user_context={}, filters_applied={})
 
-        # 4. Apply MMR to re-rank the ENTIRE filtered pool for diversity and relevance
-        if filtered_papers:
-            feed_papers = apply_mmr_to_papers(
-                filtered_papers,
-                user_profile,
-                personalized_query,
-                user_profile.mmr_lambda,
-                max_results=len(filtered_papers) # Rank all available papers
-            )
-        else:
-            feed_papers = []
-
-        # 5. Apply pagination AFTER ranking to get the specific page requested
+        # 2. Paginate the RANKED IDs to get just the 10 for the current page.
         start_idx = (page - 1) * count
         end_idx = start_idx + count
-        paginated_feed = feed_papers[start_idx:end_idx]
-        
-        # User context calculation
-        user_stats = await asyncio.to_thread(user_profile.get_stats)
-        subject_similarities = {}
-        if paginated_feed and user_profile.is_onboarded:
-            first_paper_dict = next((p for p in filtered_papers if p['arxiv_id'] == paginated_feed[0]['arxiv_id']), None)
-            if first_paper_dict and first_paper_dict.get('vector') is not None:
-                subject_similarities = await asyncio.to_thread(
-                    user_profile.get_subject_similarities,
-                    first_paper_dict['vector']
-                )
+        paginated_ids = ranked_ids[start_idx:end_idx]
 
-        # 6. Return only the paginated slice to the user
+        if not paginated_ids:
+            return FeedResponse(user_id=user_id, feed=[], pagination={}, user_context={}, filters_applied={"message": "Page number out of range"})
+
+        # 3. SLOW BUT SMALL: Fetch metadata for ONLY the 10 paginated IDs.
+        metadata_dict = await asyncio.to_thread(
+            search_sys.metadata_fetcher.fetch_batch_metadata,
+            paginated_ids
+        )
+        
+        # 4. Build the final feed objects to send to the user.
+        feed_papers = []
+        for rank_in_page, arxiv_id in enumerate(paginated_ids):
+            metadata = metadata_dict.get(arxiv_id)
+            if metadata:
+                feed_papers.append(FeedPaper(
+                    arxiv_id=metadata.arxiv_id,
+                    title=metadata.title,
+                    abstract=metadata.abstract,
+                    authors=metadata.authors,
+                    categories=metadata.categories,
+                    published_date=metadata.published,
+                    # Scores are not passed through in this optimized flow, but the ranking is correct.
+                    recommendation_score=0.0,
+                    relevance_score=0.0,
+                    diversity_score=0.0,
+                    rank=start_idx + rank_in_page + 1,
+                    recommendation_reason="Personalized for you",
+                    stats={'views': 0, 'bookmarks': 0, 'likes': 0} # Placeholder stats
+                ))
+
+        # 5. Return the final, paginated response.
         return FeedResponse(
             user_id=user_id,
-            feed=paginated_feed,
+            feed=feed_papers,
             pagination={
                 "page": page,
-                "count": len(paginated_feed),
+                "count": len(feed_papers),
                 "requested_count": count,
-                "has_more": len(feed_papers) > end_idx # Check against the full ranked list
+                "has_more": len(ranked_ids) > end_idx
             },
             user_context={
                 "is_onboarded": user_profile.is_onboarded,
-                "total_interactions": user_stats["total_interactions"],
-                "subjects": [subject["name"] for subject in user_stats["subjects"].values()],
-                "subject_similarities": subject_similarities,
                 "mmr_lambda": user_profile.mmr_lambda
             },
-            filters_applied={
-                "category": category,
-                "days_back": days_back,
-                "total_papers_pool": len(filtered_papers),
-                "using_real_data": True
-            }
+            filters_applied={"using_optimized_flow": True}
         )
-        
+
     except Exception as e:
-        logger.error(f"❌ Error generating real paper feed for {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    
+        logger.error(f"❌ Error generating optimized feed for {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))    
 
 @app.get("/debug/user/{user_id}/vectors", tags=["Debug"])
 async def debug_user_vectors(

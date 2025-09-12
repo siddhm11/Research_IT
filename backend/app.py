@@ -40,7 +40,7 @@ async def lifespan(app2: FastAPI):
         
         # Initialize user management
         from pathlib import Path
-        DB_PATH = r"C:/Users/siddh/_code_/Research_IT/backend/users.db"
+        DB_PATH = "users.db"
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)   # directory safety
         user_manager = UserEmbeddingManager(db_path=DB_PATH)
         logger.info("✅ User Management System initialized")
@@ -74,14 +74,14 @@ app = FastAPI(
 )
 
 # Add CORS middleware
+# From mini_app.py
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:8080", "http://localhost:5173"],
+    allow_origins=["https://researchhub-three.vercel.app" , "http://localhost:3000", "http://localhost:3001", "http://localhost:8080", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # --- Dependency Functions ---
 
 def get_search_system() -> SPECTER2Search:

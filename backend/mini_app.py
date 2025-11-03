@@ -699,7 +699,7 @@ async def get_ranked_paper_ids(
     to return a final, ranked list of ArXiv IDs. This function does NOT
     fetch any metadata from the external ArXiv API.
     """
-    # 1. Get the user's "taste profile" vector
+    # 1. Get the user's "taste profile" vector only complete vector for now 
     user_query = user_profile._retrieve_vector_from_qdrant(VectorType.COMPLETE)
     if user_query is None:
         logger.warning(f"User {user_profile.user_id} has no query vector. Returning empty list.")
@@ -715,7 +715,7 @@ async def get_ranked_paper_ids(
         with_vectors=True  # Crucially, we get the vectors here
     )
 
-    # 3. Prepare the list for the MMR algorithm.
+    # 3. Prepare the list for the MMR algorithm means Maximum Marginal Relevance to find serendipity in the answers. (serendipity  means the change in output instead of following only the same type of data being given , a little wrong answers are also shown so that it is something useful  and not just the same type of answers being given out in the output)
     # The MMR function needs a list of dictionaries with specific keys.
     papers_for_mmr = [
         {
@@ -723,6 +723,8 @@ async def get_ranked_paper_ids(
             "arxiv_id": result.payload.get("arxiv_id"),
             "vector": np.array(result.vector),
             # Dummy data to match the function's expected input shape:
+            # ** check later ** 
+            # why is this needed and if needed it shouldnt be empty?
             "title": "", "abstract": "", "authors": [], "categories": [], "published_date": ""
         }
         for result in qdrant_results if result.payload.get("arxiv_id") and result.vector
@@ -743,6 +745,8 @@ async def get_ranked_paper_ids(
     # 5. Extract and return just the final, ranked list of ArXiv IDs.
     ranked_ids = [p['arxiv_id'] for p in ranked_papers]
     return ranked_ids
+
+
 
 @app.get("/users/{user_id}/feed", response_model=FeedResponse, tags=["Feed"])
 async def get_user_feed(
